@@ -1,0 +1,111 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/cenkalti/backoff/v5"
+	"github.com/tinkerbell/tinkerbell/api/v1alpha1/bmc"
+	tinkerbell "github.com/tinkerbell/tinkerbell/api/v1alpha1/tinkerbell"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+)
+
+const (
+	trueString = "true"
+
+	// defaultBMCConnectTimeout is used when the caller leaves the BMC connect timeout unset.
+	defaultBMCConnectTimeout = time.Minute
+)
+
+var schemeBuilder = runtime.NewSchemeBuilder(
+	scheme.AddToScheme,
+	bmc.AddToScheme,
+	// Needed so the Machine controller can read/write the linked Hardware object's
+	// status.attributes.outOfBand field.
+	tinkerbell.AddToScheme,
+)
+
+// DefaultScheme returns a scheme with all the types necessary for the Rufio controller.
+func DefaultScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	_ = schemeBuilder.AddToScheme(s)
+	return s
+}
+
+// Reconciler is a type for managing Workflows.
+type Reconciler struct {
+	client  client.Client
+	nowFunc func() time.Time
+	backoff *backoff.ExponentialBackOff
+}
+
+// disableConfigMapCache makes the manager's client read ConfigMaps straight from the API server.
+// ConfigMaps are read rarely and one at a time (a Secure Boot certificate), and a cached read
+// would need list and watch on every ConfigMap in the cluster and would block until the informer
+// syncs, hanging the Task reconciler when that access isn't granted. A direct read only needs get
+// on the referenced ConfigMap.
+func disableConfigMapCache(opts *ctrl.Options) {
+	if opts.Client.Cache == nil {
+		opts.Client.Cache = &client.CacheOptions{}
+	}
+	opts.Client.Cache.DisableFor = append(opts.Client.Cache.DisableFor, &corev1.ConfigMap{})
+}
+
+func NewManager(cfg *rest.Config, opts ctrl.Options, bmcConnectTimeout, powerCheckInterval, inventoryRefreshInterval time.Duration, inventoryCollectionEnabled bool, maxConcurrentReconciles int) (ctrl.Manager, error) {
+	if opts.Scheme == nil {
+		opts.Scheme = DefaultScheme()
+	}
+
+	if bmcConnectTimeout <= 0 {
+		bmcConnectTimeout = defaultBMCConnectTimeout
+	}
+
+	disableConfigMapCache(&opts)
+
+	mgr, err := ctrl.NewManager(cfg, opts)
+	if err != nil {
+		return nil, fmt.Errorf("controller manager: %w", err)
+	}
+
+	ctrlOpts := ctrlcontroller.Options{MaxConcurrentReconciles: maxConcurrentReconciles}
+	if err := NewReconciler(mgr.GetClient()).SetupWithManager(context.Background(), mgr, NewClientFunc(bmcConnectTimeout), powerCheckInterval, inventoryRefreshInterval, inventoryCollectionEnabled, ctrlOpts); err != nil {
+		return nil, fmt.Errorf("unable to create reconciler: %w", err)
+	}
+
+	return mgr, nil
+}
+
+// TODO(jacobweinstock): add functional arguments to the signature.
+// TODO(jacobweinstock): write functional argument for customizing the backoff.
+func NewReconciler(c client.Client) *Reconciler {
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxInterval = 5 * time.Second
+	return &Reconciler{
+		client:  c,
+		nowFunc: time.Now,
+		backoff: bo,
+	}
+}
+
+func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, bmcClient ClientFunc, powerCheckInterval, inventoryRefreshInterval time.Duration, inventoryCollectionEnabled bool, opts ctrlcontroller.Options) error {
+	if err := NewMachineReconciler(mgr.GetClient(), mgr.GetEventRecorder("machine-controller"), bmcClient, powerCheckInterval, inventoryRefreshInterval, inventoryCollectionEnabled).SetupWithManager(ctx, mgr, opts); err != nil {
+		return fmt.Errorf("unable to create Machines controller: %w", err)
+	}
+
+	if err := NewJobReconciler(mgr.GetClient()).SetupWithManager(ctx, mgr, opts); err != nil {
+		return fmt.Errorf("unable to create Jobs controller: %w", err)
+	}
+
+	if err := NewTaskReconciler(mgr.GetClient(), bmcClient).SetupWithManager(mgr, opts); err != nil {
+		return fmt.Errorf("unable to create Tasks controller: %w", err)
+	}
+
+	return nil
+}

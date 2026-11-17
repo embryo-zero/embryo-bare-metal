@@ -1,0 +1,729 @@
+package webhttp
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	bmcv1alpha1 "github.com/tinkerbell/tinkerbell/api/v1alpha1/bmc"
+	tinkv1alpha1 "github.com/tinkerbell/tinkerbell/api/v1alpha1/tinkerbell"
+	"github.com/tinkerbell/tinkerbell/ui/templates"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+)
+
+func init() {
+	gin.SetMode(gin.TestMode)
+}
+
+func TestGetHardwareInterfaces(t *testing.T) {
+	tests := []struct {
+		name     string
+		hardware tinkv1alpha1.Hardware
+		want     []templates.HardwareInterface
+	}{
+		{
+			name: "no interfaces",
+			hardware: tinkv1alpha1.Hardware{
+				Spec: tinkv1alpha1.HardwareSpec{
+					Interfaces: nil,
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "single interface with MAC and IP",
+			hardware: tinkv1alpha1.Hardware{
+				Spec: tinkv1alpha1.HardwareSpec{
+					Interfaces: []tinkv1alpha1.Interface{
+						{
+							DHCP: &tinkv1alpha1.DHCP{
+								MAC: "aa:bb:cc:dd:ee:ff",
+								IP: &tinkv1alpha1.IP{
+									Address: "192.168.1.100",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []templates.HardwareInterface{
+				{MAC: "aa:bb:cc:dd:ee:ff", IP: "192.168.1.100"},
+			},
+		},
+		{
+			name: "interface with MAC only",
+			hardware: tinkv1alpha1.Hardware{
+				Spec: tinkv1alpha1.HardwareSpec{
+					Interfaces: []tinkv1alpha1.Interface{
+						{
+							DHCP: &tinkv1alpha1.DHCP{
+								MAC: "aa:bb:cc:dd:ee:ff",
+							},
+						},
+					},
+				},
+			},
+			want: []templates.HardwareInterface{
+				{MAC: "aa:bb:cc:dd:ee:ff", IP: ""},
+			},
+		},
+		{
+			name: "multiple interfaces",
+			hardware: tinkv1alpha1.Hardware{
+				Spec: tinkv1alpha1.HardwareSpec{
+					Interfaces: []tinkv1alpha1.Interface{
+						{
+							DHCP: &tinkv1alpha1.DHCP{
+								MAC: "aa:bb:cc:dd:ee:01",
+								IP: &tinkv1alpha1.IP{
+									Address: "192.168.1.101",
+								},
+							},
+						},
+						{
+							DHCP: &tinkv1alpha1.DHCP{
+								MAC: "aa:bb:cc:dd:ee:02",
+								IP: &tinkv1alpha1.IP{
+									Address: "192.168.1.102",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []templates.HardwareInterface{
+				{MAC: "aa:bb:cc:dd:ee:01", IP: "192.168.1.101"},
+				{MAC: "aa:bb:cc:dd:ee:02", IP: "192.168.1.102"},
+			},
+		},
+		{
+			name: "interface with nil DHCP",
+			hardware: tinkv1alpha1.Hardware{
+				Spec: tinkv1alpha1.HardwareSpec{
+					Interfaces: []tinkv1alpha1.Interface{
+						{
+							DHCP: nil,
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "interface with empty MAC and IP skipped",
+			hardware: tinkv1alpha1.Hardware{
+				Spec: tinkv1alpha1.HardwareSpec{
+					Interfaces: []tinkv1alpha1.Interface{
+						{
+							DHCP: &tinkv1alpha1.DHCP{
+								MAC: "",
+								IP:  nil,
+							},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetHardwareInterfaces(tt.hardware)
+
+			if len(got) != len(tt.want) {
+				t.Errorf("GetHardwareInterfaces() returned %d interfaces, want %d", len(got), len(tt.want))
+				return
+			}
+
+			for i, iface := range got {
+				if iface.MAC != tt.want[i].MAC {
+					t.Errorf("Interface[%d].MAC = %s, want %s", i, iface.MAC, tt.want[i].MAC)
+				}
+				if iface.IP != tt.want[i].IP {
+					t.Errorf("Interface[%d].IP = %s, want %s", i, iface.IP, tt.want[i].IP)
+				}
+			}
+		})
+	}
+}
+
+func TestGetHardwareStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		hardware tinkv1alpha1.Hardware
+		want     string
+	}{
+		{
+			name: "provisioning state",
+			hardware: tinkv1alpha1.Hardware{
+				Status: tinkv1alpha1.HardwareStatus{
+					State: "provisioning",
+				},
+			},
+			want: "Provisioning",
+		},
+		{
+			name: "failed state",
+			hardware: tinkv1alpha1.Hardware{
+				Status: tinkv1alpha1.HardwareStatus{
+					State: "failed",
+				},
+			},
+			want: "Offline",
+		},
+		{
+			name: "empty state defaults to Online",
+			hardware: tinkv1alpha1.Hardware{
+				Status: tinkv1alpha1.HardwareStatus{
+					State: "",
+				},
+			},
+			want: "Online",
+		},
+		{
+			name: "unknown state defaults to Online",
+			hardware: tinkv1alpha1.Hardware{
+				Status: tinkv1alpha1.HardwareStatus{
+					State: "something-else",
+				},
+			},
+			want: "Online",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetHardwareStatus(tt.hardware)
+			if got != tt.want {
+				t.Errorf("GetHardwareStatus() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetBMCJobStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		conditions []bmcv1alpha1.JobCondition
+		want       string
+	}{
+		{
+			name:       "no conditions",
+			conditions: nil,
+			want:       "Pending",
+		},
+		{
+			name: "completed condition",
+			conditions: []bmcv1alpha1.JobCondition{
+				{
+					Type:   bmcv1alpha1.JobCompleted,
+					Status: bmcv1alpha1.ConditionTrue,
+				},
+			},
+			want: "Completed",
+		},
+		{
+			name: "failed condition",
+			conditions: []bmcv1alpha1.JobCondition{
+				{
+					Type:   bmcv1alpha1.JobFailed,
+					Status: bmcv1alpha1.ConditionTrue,
+				},
+			},
+			want: "Failed",
+		},
+		{
+			name: "running condition",
+			conditions: []bmcv1alpha1.JobCondition{
+				{
+					Type:   bmcv1alpha1.JobRunning,
+					Status: bmcv1alpha1.ConditionTrue,
+				},
+			},
+			want: "Running",
+		},
+		{
+			name: "condition with false status ignored",
+			conditions: []bmcv1alpha1.JobCondition{
+				{
+					Type:   bmcv1alpha1.JobCompleted,
+					Status: bmcv1alpha1.ConditionFalse,
+				},
+			},
+			want: "Pending",
+		},
+		{
+			name: "multiple conditions returns first true match",
+			conditions: []bmcv1alpha1.JobCondition{
+				{
+					Type:   bmcv1alpha1.JobRunning,
+					Status: bmcv1alpha1.ConditionFalse,
+				},
+				{
+					Type:   bmcv1alpha1.JobCompleted,
+					Status: bmcv1alpha1.ConditionTrue,
+				},
+				{
+					Type:   bmcv1alpha1.JobFailed,
+					Status: bmcv1alpha1.ConditionTrue,
+				},
+			},
+			want: "Completed",
+		},
+		{
+			name: "completed takes priority over running",
+			conditions: []bmcv1alpha1.JobCondition{
+				{
+					Type:   bmcv1alpha1.JobRunning,
+					Status: bmcv1alpha1.ConditionTrue,
+				},
+				{
+					Type:   bmcv1alpha1.JobCompleted,
+					Status: bmcv1alpha1.ConditionTrue,
+				},
+			},
+			want: "Completed",
+		},
+		{
+			name: "failed takes priority over running",
+			conditions: []bmcv1alpha1.JobCondition{
+				{
+					Type:   bmcv1alpha1.JobRunning,
+					Status: bmcv1alpha1.ConditionTrue,
+				},
+				{
+					Type:   bmcv1alpha1.JobFailed,
+					Status: bmcv1alpha1.ConditionTrue,
+				},
+			},
+			want: "Failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetBMCJobStatus(tt.conditions)
+			if got != tt.want {
+				t.Errorf("GetBMCJobStatus() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBmcTaskType(t *testing.T) {
+	tests := []struct {
+		name   string
+		action bmcv1alpha1.Action
+		want   string
+	}{
+		{
+			name:   "empty action returns Unknown",
+			action: bmcv1alpha1.Action{},
+			want:   "Unknown",
+		},
+		{
+			name: "PowerAction returns Power",
+			action: bmcv1alpha1.Action{
+				PowerAction: ptr(bmcv1alpha1.PowerOn),
+			},
+			want: "Power",
+		},
+		{
+			name: "BootDevice returns BootDevice",
+			action: bmcv1alpha1.Action{
+				BootDevice: &bmcv1alpha1.BootDeviceConfig{
+					Device: "pxe",
+				},
+			},
+			want: "BootDevice",
+		},
+		{
+			name: "OneTimeBootDeviceAction returns BootDevice",
+			action: bmcv1alpha1.Action{
+				OneTimeBootDeviceAction: &bmcv1alpha1.OneTimeBootDeviceAction{
+					Devices: []bmcv1alpha1.BootDevice{"pxe"},
+				},
+			},
+			want: "BootDevice",
+		},
+		{
+			name: "VirtualMediaAction returns VirtualMedia",
+			action: bmcv1alpha1.Action{
+				VirtualMediaAction: &bmcv1alpha1.VirtualMediaAction{
+					MediaURL: "http://example.com/image.iso",
+					Kind:     "CD",
+				},
+			},
+			want: "VirtualMedia",
+		},
+		{
+			name: "SecureBoot returns SecureBoot",
+			action: bmcv1alpha1.Action{
+				SecureBoot: &bmcv1alpha1.SecureBootAction{Enable: ptr(true)},
+			},
+			want: "SecureBoot",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := bmcTaskType(tt.action)
+			if got != tt.want {
+				t.Errorf("bmcTaskType() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func TestBmcTaskJobRef(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace string
+		labels    map[string]string
+		want      string
+	}{
+		{
+			name:      "nil labels returns N/A",
+			namespace: "default",
+			labels:    nil,
+			want:      "N/A",
+		},
+		{
+			name:      "empty labels returns N/A",
+			namespace: "default",
+			labels:    map[string]string{},
+			want:      "N/A",
+		},
+		{
+			name:      "unrelated labels returns N/A",
+			namespace: "default",
+			labels:    map[string]string{"app": "test"},
+			want:      "N/A",
+		},
+		{
+			name:      "owner-name label returns namespace/name",
+			namespace: "tinkerbell",
+			labels:    map[string]string{"owner-name": "netboot-capt-playground-control-plane-qc8tr"},
+			want:      "tinkerbell/netboot-capt-playground-control-plane-qc8tr",
+		},
+		{
+			name:      "empty owner-name returns N/A",
+			namespace: "default",
+			labels:    map[string]string{"owner-name": ""},
+			want:      "N/A",
+		},
+		{
+			name:      "whitespace owner-name returns N/A",
+			namespace: "default",
+			labels:    map[string]string{"owner-name": "  "},
+			want:      "N/A",
+		},
+		{
+			name:      "owner-name with other labels returns namespace/name",
+			namespace: "default",
+			labels:    map[string]string{"app": "test", "owner-name": "my-job"},
+			want:      "default/my-job",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := bmcTaskJobRef(tt.namespace, tt.labels)
+			if got != tt.want {
+				t.Errorf("bmcTaskJobRef() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsHTMXRequest(t *testing.T) {
+	tests := []struct {
+		name       string
+		headerVal  string
+		wantResult bool
+	}{
+		{
+			name:       "htmx request with true",
+			headerVal:  "true",
+			wantResult: true,
+		},
+		{
+			name:       "not htmx request - empty header",
+			headerVal:  "",
+			wantResult: false,
+		},
+		{
+			name:       "not htmx request - false value",
+			headerVal:  "false",
+			wantResult: false,
+		},
+		{
+			name:       "not htmx request - random value",
+			headerVal:  "something",
+			wantResult: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+			if tt.headerVal != "" {
+				c.Request.Header.Set("HX-Request", tt.headerVal)
+			}
+
+			got := IsHTMXRequest(c)
+			if got != tt.wantResult {
+				t.Errorf("IsHTMXRequest() = %v, want %v", got, tt.wantResult)
+			}
+		})
+	}
+}
+
+func TestConstants(t *testing.T) {
+	// Verify constants are as expected
+	if templates.AllNamespace != "All" {
+		t.Errorf("AllNamespace = %s, want 'All'", templates.AllNamespace)
+	}
+	if DefaultItemsPerPage != 10 {
+		t.Errorf("DefaultItemsPerPage = %d, want 10", DefaultItemsPerPage)
+	}
+	if MaxItemsPerPage != 100 {
+		t.Errorf("MaxItemsPerPage = %d, want 100", MaxItemsPerPage)
+	}
+}
+
+func TestValidateItemsPerPage(t *testing.T) {
+	tests := []struct {
+		name  string
+		input int
+		want  int
+	}{
+		{
+			name:  "valid value returns same",
+			input: 25,
+			want:  25,
+		},
+		{
+			name:  "zero returns default",
+			input: 0,
+			want:  DefaultItemsPerPage,
+		},
+		{
+			name:  "negative returns default",
+			input: -5,
+			want:  DefaultItemsPerPage,
+		},
+		{
+			name:  "exactly max allowed",
+			input: 100,
+			want:  100,
+		},
+		{
+			name:  "exceeds max returns max",
+			input: 200,
+			want:  MaxItemsPerPage,
+		},
+		{
+			name:  "minimum valid value",
+			input: 1,
+			want:  1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ValidateItemsPerPage(tt.input)
+			if got != tt.want {
+				t.Errorf("ValidateItemsPerPage(%d) = %d, want %d", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetKubeClientFromGinContext_Success(t *testing.T) {
+	kubeClient := newFakeKubeClient()
+	c, _ := setupTestContext("/", kubeClient)
+
+	got, err := GetKubeClientFromGinContext(c)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if got != kubeClient {
+		t.Error("returned client should match set client")
+	}
+}
+
+func TestGetKubeClientFromGinContext_Missing(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	// Don't set kubeClient
+
+	_, err := GetKubeClientFromGinContext(c)
+	if err == nil {
+		t.Error("expected error when kubeClient is not set")
+	}
+}
+
+func TestGetKubeNamespaces_WithNamespaces(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		newTestNamespace("kube-system"),
+		newTestNamespace("tinkerbell"),
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	namespaces := GetKubeNamespaces(c.Request.Context(), c, kubeClient, testLog)
+
+	if len(namespaces) != 3 {
+		t.Errorf("len(namespaces) = %d, want 3", len(namespaces))
+	}
+}
+
+func TestGetKubeNamespaces_NilClient(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	namespaces := GetKubeNamespaces(c.Request.Context(), c, nil, testLog)
+
+	if len(namespaces) != 0 {
+		t.Errorf("namespaces = %v, want []", namespaces)
+	}
+}
+
+func TestKubeClientInNamespace(t *testing.T) {
+	ctx := context.Background()
+	mapper := meta.NewDefaultRESTMapper(nil)
+	for _, kind := range []string{"Hardware", "HardwareList", "Workflow", "WorkflowList"} {
+		mapper.Add(tinkv1alpha1.GroupVersion.WithKind(kind), meta.RESTScopeNamespace)
+	}
+	c := fake.NewClientBuilder().WithScheme(newTestScheme()).WithRESTMapper(mapper).WithRuntimeObjects(
+		newTestHardware("in", "tink", "", ""), newTestHardware("out", "other", "", ""),
+	).Build()
+	k := (&KubeClient{Client: c}).InNamespaces("tink")
+
+	namespaces, err := k.ListNamespaces(ctx)
+	if err != nil || len(namespaces) != 1 || namespaces[0] != "tink" {
+		t.Fatalf("ListNamespaces = %v, %v; want [tink]", namespaces, err)
+	}
+	for _, ns := range []string{"", templates.AllNamespace, "tink"} {
+		list, err := k.ListHardware(ctx, ns)
+		if err != nil || len(list.Items) != 1 || list.Items[0].Name != "in" {
+			t.Fatalf("ListHardware(%q) = %v, %v; want only tink/in", ns, list, err)
+		}
+	}
+	if _, err := k.ListHardware(ctx, "other"); err == nil {
+		t.Fatal("ListHardware in another namespace must fail")
+	}
+	if _, err := k.GetHardware(ctx, "other", "out"); err == nil {
+		t.Fatal("GetHardware in another namespace must fail")
+	}
+	if _, err := k.GetHardware(ctx, "tink", "in"); err != nil {
+		t.Fatal(err)
+	}
+	wf := newTestWorkflow("wf", "tpl", tinkv1alpha1.WorkflowStatePending)
+	wf.Namespace = "other"
+	if err := k.Create(ctx, wf); err == nil {
+		t.Fatal("Create in another namespace must fail")
+	}
+}
+
+func TestKubeClientInSeveralNamespaces(t *testing.T) {
+	ctx := context.Background()
+	mapper := meta.NewDefaultRESTMapper(nil)
+	for _, kind := range []string{"Hardware", "HardwareList", "Workflow", "WorkflowList"} {
+		mapper.Add(tinkv1alpha1.GroupVersion.WithKind(kind), meta.RESTScopeNamespace)
+	}
+	var listed []string
+	c := fake.NewClientBuilder().WithScheme(newTestScheme()).WithRESTMapper(mapper).WithRuntimeObjects(
+		newTestHardware("a", "tink-a", "", ""), newTestHardware("b", "tink-b", "", ""), newTestHardware("out", "other", "", ""),
+	).WithInterceptorFuncs(interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		listed = append(listed, (&client.ListOptions{}).ApplyOptions(opts).Namespace)
+		return c.List(ctx, list, opts...)
+	}}).Build()
+	k := (&KubeClient{Client: c}).InNamespaces("tink-a", "tink-b")
+
+	namespaces, err := k.ListNamespaces(ctx)
+	if err != nil || !slices.Equal(namespaces, []string{"tink-a", "tink-b"}) {
+		t.Fatalf("ListNamespaces = %v, %v; want [tink-a tink-b]", namespaces, err)
+	}
+	for _, ns := range []string{"", templates.AllNamespace} {
+		listed = nil
+		list, err := k.ListHardware(ctx, ns)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, hw := range list.Items {
+			names = append(names, hw.Namespace+"/"+hw.Name)
+		}
+		slices.Sort(names)
+		if !slices.Equal(names, []string{"tink-a/a", "tink-b/b"}) {
+			t.Fatalf("ListHardware(%q) = %v, want tink-a/a and tink-b/b", ns, names)
+		}
+		if !slices.Equal(listed, []string{"tink-a", "tink-b"}) {
+			t.Fatalf("ListHardware(%q) listed namespaces %q, want one List per namespace and none cluster-wide", ns, listed)
+		}
+	}
+	if list, err := k.ListHardware(ctx, "tink-b"); err != nil || len(list.Items) != 1 || list.Items[0].Name != "b" {
+		t.Fatalf("ListHardware(tink-b) = %v, %v; want only tink-b/b", list, err)
+	}
+	if _, err := k.ListHardware(ctx, "other"); err == nil {
+		t.Fatal("ListHardware in another namespace must fail")
+	}
+	if _, err := k.GetHardware(ctx, "tink-b", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.GetHardware(ctx, "other", "out"); err == nil {
+		t.Fatal("GetHardware in another namespace must fail")
+	}
+	for _, ns := range []string{"other", ""} {
+		wf := newTestWorkflow("wf", "tpl", tinkv1alpha1.WorkflowStatePending)
+		wf.Namespace = ns
+		if err := k.Create(ctx, wf); err == nil {
+			t.Fatalf("Create in namespace %q must fail with several namespaces", ns)
+		}
+	}
+	wf := newTestWorkflow("wf", "tpl", tinkv1alpha1.WorkflowStatePending)
+	wf.Namespace = "tink-b"
+	disabled := true
+	wf.Spec.Disabled = &disabled
+	if err := k.Create(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.EnableWorkflow(ctx, "tink-b", "wf"); err != nil {
+		t.Fatalf("EnableWorkflow in a listed namespace: %v", err)
+	}
+	stored := &tinkv1alpha1.Workflow{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "tink-b", Name: "wf"}, stored); err != nil || stored.Spec.Disabled == nil || *stored.Spec.Disabled {
+		t.Fatalf("stored workflow disabled = %v, %v; want enabled", stored.Spec.Disabled, err)
+	}
+	outside := newTestWorkflow("wf", "tpl", tinkv1alpha1.WorkflowStatePending)
+	outside.Namespace = "other"
+	outside.Spec.Disabled = &disabled
+	if err := c.Create(ctx, outside); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.EnableWorkflow(ctx, "other", "wf"); err == nil {
+		t.Fatal("EnableWorkflow in another namespace must fail")
+	}
+	if err := k.Status().Update(ctx, &tinkv1alpha1.Workflow{ObjectMeta: metav1.ObjectMeta{Name: "wf", Namespace: "other"}}); err == nil {
+		t.Fatal("status Update in another namespace must fail")
+	}
+}

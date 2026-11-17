@@ -1,0 +1,377 @@
+package file
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
+	"github.com/tinkerbell/tinkerbell/pkg/data"
+)
+
+func TestNewWatcher(t *testing.T) {
+	tests := map[string]struct {
+		createFile bool
+		want       string
+		wantErr    error
+	}{
+		"contents equal": {createFile: true, want: "test content here"},
+		"file not found": {createFile: false, wantErr: &fs.PathError{}},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			var name string
+			if tt.createFile {
+				var err error
+				name, err = createFile([]byte(tt.want))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.Remove(name)
+			}
+			w, err := NewWatcher(logr.Discard(), name)
+			if (err != nil) != (tt.wantErr != nil) {
+				t.Fatalf("NewWatcher() error = %v; type = %[1]T, wantErr %v; type = %[2]T", err, tt.wantErr)
+			}
+			var got string
+			if tt.wantErr != nil {
+				got = ""
+			} else {
+				got = string(w.data)
+			}
+			if diff := cmp.Diff(got, tt.want); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
+
+func createFile(content []byte) (string, error) {
+	file, err := os.CreateTemp("", "prefix")
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	if _, err := file.Write(content); err != nil {
+		return "", err
+	}
+	return file.Name(), nil
+}
+
+type testData struct {
+	initial     string
+	after       string
+	action      string
+	expectedOut string
+}
+
+// noTime removes the time key from the slog output.
+var noTime = &slog.HandlerOptions{ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.TimeKey {
+		return slog.Attr{}
+	}
+	return a
+}}
+
+func TestStartAndStop(t *testing.T) {
+	tt := &testData{action: "cancel", expectedOut: `{"level":"INFO","msg":"stopping watcher"}` + "\n"}
+	out := &bytes.Buffer{}
+	l := logr.FromSlogHandler(slog.NewJSONHandler(out, noTime))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &Watcher{Log: l, watcher: watcher}
+	w.Start(ctx)
+	if diff := cmp.Diff(out.String(), tt.expectedOut); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func TestStartFileUpdateError(t *testing.T) {
+	expected := `{"level":"INFO","msg":"file changed, updating cache"}
+{"level":"ERROR","msg":"failed to read file","err":"open not-found.txt: no such file or directory","file":"not-found.txt"}
+{"level":"INFO","msg":"stopping watcher"}
+`
+	tt := &testData{expectedOut: expected}
+	out := &bytes.Buffer{}
+	l := logr.FromSlogHandler(slog.NewJSONHandler(out, noTime))
+	got, name := tt.helper(t, l)
+	defer os.Remove(name)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-time.After(time.Millisecond)
+		got.FilePath = "not-found.txt"
+		got.watcher.Events <- fsnotify.Event{Op: fsnotify.Write}
+		cancel()
+	}()
+	got.Start(ctx)
+	time.Sleep(time.Second)
+	if diff := cmp.Diff(out.String(), tt.expectedOut); diff != "" {
+		t.Log(out.String())
+		t.Fatal(diff)
+	}
+}
+
+func TestStartFileUpdate(t *testing.T) {
+	tt := &testData{initial: "once upon a time", after: "\nhello world", expectedOut: "once upon a time\nhello world"}
+	got, name := tt.helper(t, logr.Discard())
+	defer os.Remove(name)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-time.After(time.Millisecond)
+		got.fileMu.Lock()
+		f, err := os.OpenFile(name, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Log(err)
+		}
+		f.Write([]byte(tt.after))
+		f.Close()
+		got.fileMu.Unlock()
+		// Poll until the watcher has processed the file update instead of
+		// using a fixed sleep, which is racy on slow CI machines.
+		deadline := time.After(5 * time.Second)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-deadline:
+				cancel()
+				return
+			case <-ticker.C:
+				got.dataMu.RLock()
+				d := string(got.data)
+				got.dataMu.RUnlock()
+				if d == tt.expectedOut {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	got.Start(ctx)
+	got.dataMu.RLock()
+	d := got.data
+	got.dataMu.RUnlock()
+	if diff := cmp.Diff(string(d), tt.expectedOut); diff != "" {
+		t.Log(string(d))
+		t.Fatal(diff)
+	}
+}
+
+func TestStartFileUpdateClosedChan(t *testing.T) {
+	out := &bytes.Buffer{}
+	l := logr.FromSlogHandler(slog.NewJSONHandler(out, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &Watcher{Log: l, watcher: watcher}
+	go w.Start(ctx)
+	close(w.watcher.Events)
+	time.Sleep(time.Millisecond)
+	if diff := cmp.Diff(out.String(), ""); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func TestStartError(t *testing.T) {
+	expected := `{"level":"INFO","msg":"error watching file","err":"test error"}
+{"level":"INFO","msg":"stopping watcher"}
+`
+	tt := &testData{expectedOut: expected}
+	out := &bytes.Buffer{}
+	l := logr.FromSlogHandler(slog.NewJSONHandler(out, noTime))
+	ctx, cancel := context.WithCancel(context.Background())
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &Watcher{Log: l, watcher: watcher}
+	go func() {
+		time.Sleep(time.Millisecond)
+		w.watcher.Errors <- fmt.Errorf("test error")
+		cancel()
+	}()
+	w.Start(ctx)
+	if diff := cmp.Diff(out.String(), tt.expectedOut); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func TestStartErrorContinue(t *testing.T) {
+	out := &bytes.Buffer{}
+	l := logr.FromSlogHandler(slog.NewJSONHandler(out, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &Watcher{Log: l, watcher: watcher}
+	go w.Start(ctx)
+	close(w.watcher.Errors)
+	time.Sleep(time.Millisecond)
+	if diff := cmp.Diff(out.String(), ""); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func (tt *testData) helper(t *testing.T, l logr.Logger) (*Watcher, string) {
+	t.Helper()
+	name, err := createFile([]byte(tt.initial))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(l, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.dataMu.RLock()
+	before := string(w.data)
+	w.dataMu.RUnlock()
+	if diff := cmp.Diff(before, tt.initial); diff != "" {
+		t.Fatal("before", diff)
+	}
+
+	return w, name
+}
+
+func TestReadHardwareByMac(t *testing.T) {
+	tests := map[string]struct {
+		mac          string
+		badData      bool
+		wantErr      error
+		wantNotFound bool
+	}{
+		"no record found":   {mac: "00:01:02:03:04:05", wantNotFound: true},
+		"record found":      {mac: "08:00:27:29:4e:67"},
+		"fail parsing file": {badData: true, wantErr: errFileFormat},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			dataFile := "testdata/example.yaml"
+			if tt.badData {
+				var err error
+				dataFile, err = createFile([]byte("not a yaml file"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.Remove(dataFile)
+			}
+			w, err := NewWatcher(logr.Discard(), dataFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hw, err := w.FilterHardware(context.Background(), data.HardwareFilter{ByMACAddress: tt.mac})
+			if tt.wantNotFound {
+				var nf hardwareNotFoundError
+				if !errors.As(err, &nf) {
+					t.Fatalf("FilterHardware() error = %v, want NotFound error", err)
+				}
+			} else if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("FilterHardware() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr == nil && !tt.wantNotFound && hw == nil {
+				t.Fatal("expected hardware, got nil")
+			}
+		})
+	}
+}
+
+func TestReadHardwareByIP(t *testing.T) {
+	tests := map[string]struct {
+		ip           string
+		badData      bool
+		wantErr      error
+		wantNotFound bool
+	}{
+		"no record found":   {ip: "172.168.2.1", wantNotFound: true},
+		"record found":      {ip: "192.168.2.153"},
+		"fail parsing file": {badData: true, wantErr: errFileFormat},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			dataFile := "testdata/example.yaml"
+			if tt.badData {
+				var err error
+				dataFile, err = createFile([]byte("not a yaml file"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.Remove(dataFile)
+			}
+			w, err := NewWatcher(logr.Discard(), dataFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hw, err := w.FilterHardware(context.Background(), data.HardwareFilter{ByIPAddress: tt.ip})
+			if tt.wantNotFound {
+				var nf hardwareNotFoundError
+				if !errors.As(err, &nf) {
+					t.Fatalf("FilterHardware() error = %v, want NotFound error", err)
+				}
+			} else if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("FilterHardware() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr == nil && !tt.wantNotFound && hw == nil {
+				t.Fatal("expected hardware, got nil")
+			}
+		})
+	}
+}
+
+func TestReadHardwareByName(t *testing.T) {
+	tests := map[string]struct {
+		name     string
+		wantErr  bool
+		notFound bool
+	}{
+		"no record found": {name: "nonexistent", wantErr: true, notFound: true},
+		"record found":    {name: "pxe-virtualbox", wantErr: false},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			w, err := NewWatcher(logr.Discard(), "testdata/example.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			hw, err := w.ReadHardware(context.Background(), tt.name, "")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if tt.notFound {
+					type nf interface{ NotFound() bool }
+					var nfe nf
+					if !errors.As(err, &nfe) || !nfe.NotFound() {
+						t.Fatalf("expected NotFound error, got %v", err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ReadHardware() unexpected error = %v", err)
+			}
+			if hw == nil {
+				t.Fatal("expected hardware, got nil")
+			}
+		})
+	}
+}

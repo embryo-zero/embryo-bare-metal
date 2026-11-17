@@ -1,0 +1,349 @@
+package webhttp
+
+import (
+	"net/http"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	tinkv1alpha1 "github.com/tinkerbell/tinkerbell/api/v1alpha1/tinkerbell"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func TestHandleHardwareList_Empty(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+	)
+
+	c, w := setupTestContext("/hardware", kubeClient)
+
+	HandleHardwareList(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "text/html" {
+		t.Errorf("Content-Type = %s, want text/html", ct)
+	}
+}
+
+func TestHandleHardwareList_WithData(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		newTestHardware("hw-1", "default", "aa:bb:cc:dd:ee:01", "192.168.1.1"),
+		newTestHardware("hw-2", "default", "aa:bb:cc:dd:ee:02", "192.168.1.2"),
+	)
+
+	c, w := setupTestContext("/hardware", kubeClient)
+
+	HandleHardwareList(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !contains(body, "hw-1") {
+		t.Error("response should contain hw-1")
+	}
+	if !contains(body, "hw-2") {
+		t.Error("response should contain hw-2")
+	}
+}
+
+func TestHandleHardwareList_HTMXRequest(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		newTestHardware("hw-1", "default", "aa:bb:cc:dd:ee:01", "192.168.1.1"),
+	)
+
+	c, w := setupTestContext("/hardware", kubeClient)
+	c.Request.Header.Set("HX-Request", "true")
+
+	HandleHardwareList(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	// HTMX requests return partial content (table only)
+	body := w.Body.String()
+	if !contains(body, "hw-1") {
+		t.Error("HTMX response should contain hw-1")
+	}
+}
+
+func TestHandleHardwareList_Pagination(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		newTestHardware("hw-1", "default", "aa:bb:cc:dd:ee:01", "192.168.1.1"),
+		newTestHardware("hw-2", "default", "aa:bb:cc:dd:ee:02", "192.168.1.2"),
+	)
+
+	c, w := setupTestContext("/hardware?page=1&per_page=1", kubeClient)
+
+	HandleHardwareList(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandleHardwareList_NamespaceFilter(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("ns1"),
+		newTestNamespace("ns2"),
+		newTestHardware("hw-1", "ns1", "aa:bb:cc:dd:ee:01", "192.168.1.1"),
+		newTestHardware("hw-2", "ns2", "aa:bb:cc:dd:ee:02", "192.168.1.2"),
+	)
+
+	c, w := setupTestContext("/hardware?namespace=ns1", kubeClient)
+
+	HandleHardwareList(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !contains(body, "hw-1") {
+		t.Error("response should contain hw-1 (ns1)")
+	}
+}
+
+func TestHandleHardwareDetail_Found(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		newTestHardware("hw-1", "default", "aa:bb:cc:dd:ee:01", "192.168.1.1"),
+	)
+
+	c, w := setupTestContext("/hardware/default/hw-1", kubeClient)
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "hw-1"},
+	}
+
+	HandleHardwareDetail(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !contains(body, "hw-1") {
+		t.Error("response should contain hw-1")
+	}
+}
+
+func TestHandleHardwareDetail_WithOutOfBandAttributes(t *testing.T) {
+	hw := newTestHardware("hw-1", "default", "aa:bb:cc:dd:ee:01", "192.168.1.1")
+	hw.Status.Attributes = &tinkv1alpha1.HardwareAttributes{
+		OutOfBand: &tinkv1alpha1.Attributes{
+			LastUpdated:      &metav1.Time{},
+			CollectionMethod: "redfish",
+			BIOS: &tinkv1alpha1.BIOS{
+				Vendor:          "Dell Inc.",
+				FirmwareVersion: "2.10.2",
+			},
+			PSUs: []tinkv1alpha1.PSU{
+				{
+					Vendor: "Dell",
+					Status: &tinkv1alpha1.ComponentStatus{Health: "OK"},
+				},
+			},
+		},
+	}
+
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		hw,
+	)
+
+	c, w := setupTestContext("/hardware/default/hw-1", kubeClient)
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "hw-1"},
+	}
+
+	HandleHardwareDetail(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !contains(body, "Out-of-Band Attributes") {
+		t.Error("response should contain the Out-of-Band Attributes section")
+	}
+	if !contains(body, "Dell Inc.") {
+		t.Error("response should contain the BIOS vendor")
+	}
+	if !contains(body, "2.10.2") {
+		t.Error("response should contain the BIOS firmware version")
+	}
+}
+
+func TestHandleHardwareDetail_WithoutOutOfBandAttributes(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		newTestHardware("hw-1", "default", "aa:bb:cc:dd:ee:01", "192.168.1.1"),
+	)
+
+	c, w := setupTestContext("/hardware/default/hw-1", kubeClient)
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "hw-1"},
+	}
+
+	HandleHardwareDetail(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if contains(body, "Out-of-Band Attributes") {
+		t.Error("response should not contain the Out-of-Band Attributes section when unset")
+	}
+}
+
+func TestHandleHardwareDetail_NotFound(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+	)
+
+	c, w := setupTestContext("/hardware/default/nonexistent", kubeClient)
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "nonexistent"},
+	}
+
+	HandleHardwareDetail(c, testLog)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestHandleHardwareDetail_WithInBandAttributes(t *testing.T) {
+	hw := newTestHardware("hw-1", "default", "aa:bb:cc:dd:ee:01", "192.168.1.1")
+	hw.Status.Attributes = &tinkv1alpha1.HardwareAttributes{
+		InBand: &tinkv1alpha1.Attributes{
+			CollectionMethod: "agent",
+			CPU: &tinkv1alpha1.CPU{
+				TotalCores:   8,
+				TotalThreads: 16,
+			},
+			Product: &tinkv1alpha1.Product{
+				Name:   "PowerEdge R750",
+				Vendor: "Dell Inc.",
+			},
+			NetworkInterfaces: []tinkv1alpha1.NetworkInterface{
+				{
+					Name: "eno1",
+					Ports: []tinkv1alpha1.NetworkPort{
+						{
+							MAC: "aa:bb:cc:dd:ee:ff",
+							LLDPNeighbors: []tinkv1alpha1.LLDPNeighbor{
+								{
+									ChassisID:  "aa:bb:cc:00:11:22",
+									SystemName: "switch01",
+									PortID:     "Gi1/0/1",
+								},
+								{
+									ChassisID:  "aa:bb:cc:00:11:33",
+									SystemName: "vswitch01",
+									PortID:     "vnet0",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		hw,
+	)
+
+	c, w := setupTestContext("/hardware/default/hw-1", kubeClient)
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "hw-1"},
+	}
+
+	HandleHardwareDetail(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !contains(body, "System Overview") {
+		t.Error("response should contain the In-Band Attributes section content")
+	}
+	if !contains(body, "PowerEdge R750") {
+		t.Error("response should contain the in-band Product.Name")
+	}
+	if !contains(body, "8 cores") {
+		t.Error("response should contain the in-band CPU core count")
+	}
+	if !contains(body, "switch01") {
+		t.Error("response should contain the LLDP neighbor's SystemName")
+	}
+	if !contains(body, "Gi1/0/1") {
+		t.Error("response should contain the LLDP neighbor's PortID")
+	}
+	if !contains(body, "vswitch01") || !contains(body, "vnet0") {
+		t.Error("response should contain every LLDP neighbor on the port, not just the first")
+	}
+}
+
+func TestHandleHardwareDetail_WithoutInBandAttributes(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		newTestHardware("hw-1", "default", "aa:bb:cc:dd:ee:01", "192.168.1.1"),
+	)
+
+	c, w := setupTestContext("/hardware/default/hw-1", kubeClient)
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "hw-1"},
+	}
+
+	HandleHardwareDetail(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if contains(body, "System Overview") {
+		t.Error("response should not contain the In-Band Attributes section content when status.attributes is unset")
+	}
+}
+
+func TestHandleHome_Empty(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+	)
+
+	c, w := setupTestContext("/", kubeClient)
+
+	HandleHome(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandleHome_WithHardware(t *testing.T) {
+	kubeClient := newFakeKubeClient(
+		newTestNamespace("default"),
+		newTestHardware("hw-1", "default", "aa:bb:cc:dd:ee:01", "192.168.1.1"),
+	)
+
+	c, w := setupTestContext("/", kubeClient)
+
+	HandleHome(c, testLog)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !contains(body, "hw-1") {
+		t.Error("response should contain hw-1")
+	}
+}

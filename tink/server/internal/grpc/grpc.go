@@ -1,0 +1,579 @@
+package grpc
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/tinkerbell/tinkerbell/api/v1alpha1/tinkerbell"
+	"github.com/tinkerbell/tinkerbell/pkg/constant"
+	"github.com/tinkerbell/tinkerbell/pkg/data"
+	"github.com/tinkerbell/tinkerbell/pkg/journal"
+	"github.com/tinkerbell/tinkerbell/pkg/proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+const (
+	errInvalidWorkflowID = "invalid workflow id"
+	errInvalidTaskName   = "invalid task name"
+	errInvalidActionName = "invalid action name"
+
+	// maxAnnotationSize is the maximum allowed size for agent attributes annotations.
+	maxAnnotationSize = 64 * 1024 // 64KB
+)
+
+var (
+	ErrBackendRead  = errors.New("error reading from backend")
+	ErrBackendWrite = errors.New("error writing to backend")
+)
+
+type Backend interface {
+	WorkflowReader
+	WorkflowUpdater
+	WorkflowLister
+	HardwareReader
+	HardwareFilterer
+	HardwareUpdater
+	HardwareInBandAttributesApplier
+}
+
+type WorkflowCreator interface {
+	CreateWorkflow(ctx context.Context, wf *tinkerbell.Workflow) error
+}
+
+type WorkflowReader interface {
+	ReadWorkflow(ctx context.Context, name, namespace string) (*tinkerbell.Workflow, error)
+}
+
+type WorkflowLister interface {
+	ListWorkflows(ctx context.Context, opts data.WorkflowFilter) ([]tinkerbell.Workflow, error)
+}
+
+type WorkflowUpdater interface {
+	UpdateWorkflow(ctx context.Context, wf *tinkerbell.Workflow, opts data.UpdateOptions) error
+}
+
+type WorkflowRuleSetLister interface {
+	ListWorkflowRuleSets(ctx context.Context, opts data.WorkflowFilter) ([]tinkerbell.WorkflowRuleSet, error)
+}
+
+type HardwareReader interface {
+	ReadHardware(ctx context.Context, name, namespace string) (*tinkerbell.Hardware, error)
+}
+
+type HardwareFilterer interface {
+	FilterHardware(ctx context.Context, opts data.HardwareFilter) (*tinkerbell.Hardware, error)
+}
+
+type HardwareUpdater interface {
+	UpdateHardware(ctx context.Context, hw *tinkerbell.Hardware, opts data.UpdateOptions) error
+}
+
+type HardwareInBandAttributesApplier interface {
+	ApplyHardwareInBandAttributes(ctx context.Context, name, namespace string, attrs *tinkerbell.Attributes) error
+}
+
+type HardwareCreator interface {
+	CreateHardware(ctx context.Context, hw *tinkerbell.Hardware) error
+}
+
+// Handler is a server that implements a workflow API.
+//
+// Each request is a single attempt; the returned gRPC status code tells the client whether
+// and when to retry. See docs/technical/designs/AGENT_SERVER_RETRY.md.
+type Handler struct {
+	Logger           logr.Logger
+	Backend          Backend
+	NowFunc          func() time.Time
+	AutoCapabilities AutoCapabilities
+
+	proto.UnimplementedWorkflowServiceServer
+}
+
+type Option func(*Handler)
+
+func NewHandler(opts ...Option) *Handler {
+	h := &Handler{
+		NowFunc: time.Now,
+	}
+
+	for _, opt := range opts {
+		opt(h)
+	}
+
+	return h
+}
+
+func (h *Handler) GetAction(ctx context.Context, req *proto.ActionRequest) (*proto.ActionResponse, error) {
+	select {
+	case <-ctx.Done():
+		return nil, status.Error(codes.Unavailable, "server shutting down")
+	default:
+	}
+
+	ctx = journal.New(ctx)
+	log := h.Logger.WithValues("agent", req.GetAgentId())
+	defer func() {
+		log.V(1).Info("GetAction code flow journal", "journal", journal.Journal(ctx))
+	}()
+	if req.GetAgentId() == "" {
+		journal.Log(ctx, "invalid Agent ID")
+		return nil, status.Errorf(codes.InvalidArgument, "invalid Agent ID")
+	}
+
+	attrs := convert(req.GetAgentAttributes())
+
+	// hwRef is used in auto discovery and enrollment to avoid multiple lookups of the Hardware object.
+	var hwRef *tinkerbell.Hardware
+	var hwErr error
+	// handle auto discovery
+	if h.AutoCapabilities.Discovery.Enabled {
+		journal.Log(ctx, "auto discovery triggered")
+		// Check if there is an existing Hardware Object.
+		// If not, Discovery creates one.
+		hw, err := h.Discover(ctx, req.GetAgentId(), attrs)
+		if err != nil {
+			journal.Log(ctx, "error auto discovering Hardware", "error", err)
+			log.Error(err, "error auto discovering Hardware")
+			hw = hwRef
+			hwErr = err
+			// We don't return the error here as we don't want to disrupt any Workflows from running.
+		}
+		hwRef = hw
+	}
+
+	wfs, err := h.Backend.ListWorkflows(ctx, data.WorkflowFilter{ByAgentID: req.GetAgentId()})
+	if err != nil {
+		// TODO: This is where we handle auto capabilities
+		journal.Log(ctx, "error getting Workflows", "error", err)
+		return nil, errors.Join(ErrBackendRead, status.Errorf(codes.Internal, "error getting workflows: %v", err))
+	}
+	if len(wfs) == 0 {
+		if h.AutoCapabilities.Enrollment.Enabled {
+			journal.Log(ctx, "auto enrollment triggered")
+			// If auto discovery is disabled, we do a Hardware object lookup.
+			// If auto discovery is enabled, we rely on the lookup and/or creation of a Hardware object from the Discover method.
+			// This means that only one Hardware lookup call is every made to the backend.
+			if !h.AutoCapabilities.Discovery.Enabled {
+				hwRef, hwErr = h.hardware(ctx, req.GetAgentId())
+			}
+			// Enrolling as if there were no Hardware would bypass its enrollmentEnabled and namespace.
+			if err := hardwareLookupError(ctx, log, req.GetAgentId(), hwErr); err != nil {
+				return nil, err
+			}
+			return nil, h.enroll(ctx, req.GetAgentId(), attrs, hwRef)
+		}
+		journal.Log(ctx, "no Workflow found")
+		return nil, status.Error(codes.NotFound, "no Workflows found")
+	}
+
+	journal.Log(ctx, "found Workflows", "workflows", len(wfs))
+	var wf tinkerbell.Workflow
+	// Scan every Workflow for this agent instead of returning on the first
+	// ineligible one. Terminal Workflows keep their Status.AgentID and so remain
+	// in the agent-ID index indefinitely; returning early would let one of them
+	// permanently shadow a later pending/running Workflow assigned to the same
+	// agent, so its Action would never be served.
+	var found, preparing, notRunning bool
+	for _, w := range wfs {
+		if len(w.Status.Tasks) == 0 {
+			continue
+		}
+		// Don't serve Actions when in a tinkerbell.WorkflowStatePreparing state.
+		// This is to prevent the Agent from starting Actions before Workflow boot options are performed.
+		if w.Spec.BootOptions.BootMode != "" && w.Status.State == tinkerbell.WorkflowStatePreparing {
+			journal.Log(ctx, "Workflow is in preparing state")
+			preparing = true
+			continue
+		}
+		if w.Status.State != tinkerbell.WorkflowStatePending && w.Status.State != tinkerbell.WorkflowStateRunning {
+			journal.Log(ctx, "Workflow not in pending or running state")
+			notRunning = true
+			continue
+		}
+		wf = w
+		found = true
+		journal.Log(ctx, "found Workflow", "workflow", wf.Name)
+		break
+	}
+	if !found {
+		switch {
+		case preparing:
+			return nil, status.Error(codes.FailedPrecondition, "Workflow is in preparing state")
+		case notRunning:
+			return nil, status.Error(codes.FailedPrecondition, "Workflow not in pending or running state")
+		default:
+			journal.Log(ctx, "no Tasks found in Workflow")
+			return nil, status.Error(codes.NotFound, "no Tasks found in Workflow")
+		}
+	}
+
+	var task *tinkerbell.Task
+	if isFirstAction(wf.Status.Tasks[0]) {
+		task = &wf.Status.Tasks[0]
+		journal.Log(ctx, "first Task, first Action")
+		hwRef = h.resolveAndAnnotateHardware(ctx, log, hwRef, wf.Spec.HardwareRef, wf.Namespace, attrs)
+	} else {
+		for i := range wf.Status.Tasks {
+			// check if all actions have been run successfully in this task.
+			// if so continue to the next task.
+			if isTaskSuccessful(wf.Status.Tasks[i]) {
+				continue
+			}
+			task = &wf.Status.Tasks[i]
+			journal.Log(ctx, "found Task", "taskID", task.ID)
+			break
+		}
+		if task == nil {
+			journal.Log(ctx, "no Tasks found")
+			return nil, status.Error(codes.NotFound, "no Tasks found")
+		}
+	}
+
+	if len(task.Actions) == 0 {
+		journal.Log(ctx, "no Actions found")
+		return nil, status.Error(codes.NotFound, "no Actions found")
+	}
+
+	action, err := resolveAction(ctx, task, wf.Status.CurrentState)
+	if err != nil {
+		return nil, err
+	}
+	// This check goes after the action is found, so that multi task Workflows can be handled.
+	if task.AgentID != req.GetAgentId() {
+		journal.Log(ctx, "Task not assigned to Agent")
+		return nil, status.Error(codes.NotFound, "Task not assigned to Agent")
+	}
+
+	// Applied independently of the legacy annotation above, and on whichever Task's first Action is
+	// currently being served (not just the Workflow's overall first Task): the Agent handling the
+	// Workflow's first Task is often an administrative Agent (e.g. for Netbox/network setup), not the
+	// Agent running on the target Hardware itself. Deferred until after the Task-assignment check above
+	// so an unassigned/spoofed Agent can't get its attributes written to Hardware status.
+	if isFirstAction(*task) {
+		h.resolveAndApplyInBandAttributes(ctx, log, hwRef, wf.Spec.HardwareRef, wf.Namespace, req.GetAgentId(), attrs)
+	}
+
+	// update the current state
+	// populate the current state and then send the action to the client.
+	wf.Status.CurrentState = &tinkerbell.CurrentState{
+		AgentID:    req.GetAgentId(),
+		TaskID:     task.ID,
+		ActionID:   action.ID,
+		State:      action.State,
+		ActionName: action.Name,
+		TaskName:   task.Name,
+	}
+
+	if err := h.Backend.UpdateWorkflow(ctx, &wf, data.UpdateOptions{StatusOnly: true}); err != nil {
+		if apierrors.IsConflict(err) {
+			return nil, status.Errorf(codes.Aborted, "error writing current state: %v", err)
+		}
+		return nil, errors.Join(ErrBackendWrite, status.Errorf(codes.Internal, "error writing current state: %v", err))
+	}
+
+	ar := &proto.ActionResponse{
+		WorkflowId: toPtr(wf.Namespace + "/" + wf.Name),
+		TaskId:     toPtr(task.ID),
+		AgentId:    toPtr(req.GetAgentId()),
+		ActionId:   toPtr(action.ID),
+		Name:       toPtr(action.Name),
+		Image:      toPtr(action.Image),
+		Timeout:    toPtr(action.Timeout),
+		Command:    action.Command,
+		Volumes:    append(task.Volumes, action.Volumes...),
+		Environment: func() []string {
+			// add task environment variables to the action environment variables.
+			joined := map[string]string{}
+			maps.Copy(joined, task.Environment)
+			maps.Copy(joined, action.Environment)
+			resp := []string{}
+			for k, v := range joined {
+				resp = append(resp, fmt.Sprintf("%s=%s", k, v))
+			}
+			sort.Strings(resp)
+			return resp
+		}(),
+		Pid: toPtr(action.Pid), //nolint:staticcheck // intentionally read the deprecated top-level Pid for backward compatibility; namespaces.pid overrides it below when set
+	}
+	if action.Namespaces != nil {
+		// Pass the namespace values through to the agent as-is. The container
+		// runtime interprets them (e.g. network "host" shares the host's
+		// network namespace); the server does not impose any semantics.
+		ar.Namespaces = &proto.Namespaces{
+			Network: toPtr(action.Namespaces.Network),
+			Pid:     toPtr(action.Namespaces.PID),
+		}
+		// Prefer namespaces.pid over the deprecated top-level pid field when set.
+		if action.Namespaces.PID != "" {
+			ar.Pid = toPtr(action.Namespaces.PID)
+		}
+	}
+
+	log.Info("sending action", "action", ar, "actionID", action.ID)
+	journal.Log(ctx, "sending Action", "action", ar)
+	return ar, nil
+}
+
+// resolveAction determines which action to serve for the given task based on the workflow's current state.
+func resolveAction(ctx context.Context, task *tinkerbell.Task, currentState *tinkerbell.CurrentState) (*tinkerbell.Action, error) {
+	switch {
+	case isFirstAction(*task):
+		journal.Log(ctx, "first Action")
+		return &task.Actions[0], nil
+
+	case currentState != nil && (currentState.State == tinkerbell.WorkflowStateRunning || currentState.State == tinkerbell.WorkflowStatePending):
+		// Re-serve the current action. This handles two restart scenarios:
+		// 1. Server restarts after serving an action but before the agent reports RUNNING
+		//    (currentState persisted as PENDING by GetAction).
+		// 2. Server restarts while the agent is executing (currentState is RUNNING).
+		for idx := range task.Actions {
+			if task.Actions[idx].ID == currentState.ActionID {
+				journal.Log(ctx, "re-serving in-progress Action", "actionID", task.Actions[idx].ID, "state", currentState.State)
+				return &task.Actions[idx], nil
+			}
+		}
+		journal.Log(ctx, "in-progress Action not found in task")
+		return nil, status.Error(codes.NotFound, "in-progress Action not found in task")
+
+	default:
+		// Get the next Action after the one defined in the current state.
+		if currentState == nil {
+			journal.Log(ctx, "no current state available")
+			return nil, status.Error(codes.FailedPrecondition, "no current state available")
+		}
+		if currentState.State != tinkerbell.WorkflowStateSuccess {
+			journal.Log(ctx, "current Action not in success state")
+			return nil, status.Error(codes.FailedPrecondition, "current Action not in success state")
+		}
+		for idx, act := range task.Actions {
+			if act.ID == currentState.ActionID {
+				if idx == len(task.Actions)-1 {
+					journal.Log(ctx, "last Action in task")
+					return nil, status.Error(codes.NotFound, "last Action in task")
+				}
+				journal.Log(ctx, "found Action", "actionID", task.Actions[idx+1].ID)
+				return &task.Actions[idx+1], nil
+			}
+		}
+		journal.Log(ctx, "no Action found")
+		return nil, status.Error(codes.NotFound, "no Action found")
+	}
+}
+
+// isFirstAction checks if the Task is at the first Action.
+func isFirstAction(t tinkerbell.Task) bool {
+	if len(t.Actions) == 0 {
+		return false
+	}
+	if t.Actions[0].State == tinkerbell.WorkflowStatePending {
+		return true
+	}
+	return false
+}
+
+func isTaskSuccessful(t tinkerbell.Task) bool {
+	if len(t.Actions) == 0 {
+		return true
+	}
+	if t.Actions[len(t.Actions)-1].State == tinkerbell.WorkflowStateSuccess {
+		return true
+	}
+	return false
+}
+
+// isAgentTerminalWorkflowState reports whether a workflow has finished its agent-driven execution.
+func isAgentTerminalWorkflowState(state tinkerbell.WorkflowState) bool {
+	switch state {
+	case tinkerbell.WorkflowStatePost,
+		tinkerbell.WorkflowStateSuccess,
+		tinkerbell.WorkflowStateFailed,
+		tinkerbell.WorkflowStateTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) ReportActionStatus(ctx context.Context, req *proto.ActionStatusRequest) (*proto.ActionStatusResponse, error) {
+	// 1. Validate the request
+	namespace, name, ok := strings.Cut(req.GetWorkflowId(), "/")
+	if !ok || namespace == "" || name == "" {
+		return nil, status.Errorf(codes.InvalidArgument, errInvalidWorkflowID)
+	}
+	if req.GetTaskId() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, errInvalidTaskName)
+	}
+	if req.GetActionId() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, errInvalidActionName)
+	}
+	// 2. Get the workflow
+	wf, err := h.Backend.ReadWorkflow(ctx, name, namespace)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, status.Errorf(codes.NotFound, "workflow %s not found", req.GetWorkflowId())
+		}
+		return nil, errors.Join(ErrBackendRead, status.Errorf(codes.Internal, "error getting workflow: %v", err))
+	}
+	// 3. Find the Action in the workflow from the request
+	for ti, task := range wf.Status.Tasks {
+		for ai, action := range task.Actions {
+			// action IDs match or this is the first action in a task
+			if action.ID == req.GetActionId() && task.AgentID == req.GetAgentId() {
+				if isAgentTerminalWorkflowState(wf.Status.State) {
+					switch req.GetActionState() {
+					case proto.ActionStatusRequest_SUCCESS, proto.ActionStatusRequest_FAILED, proto.ActionStatusRequest_TIMEOUT:
+						return &proto.ActionStatusResponse{}, nil
+					default:
+						return nil, status.Errorf(codes.FailedPrecondition, "Workflow is in %s state", wf.Status.State)
+					}
+				}
+
+				wf.Status.Tasks[ti].Actions[ai].State = tinkerbell.WorkflowState(req.GetActionState().String())
+				wf.Status.Tasks[ti].Actions[ai].ExecutionStart = &metav1.Time{Time: req.GetExecutionStart().AsTime()}
+				wf.Status.Tasks[ti].Actions[ai].ExecutionStop = &metav1.Time{Time: req.GetExecutionStop().AsTime()}
+				wf.Status.Tasks[ti].Actions[ai].ExecutionDuration = req.GetExecutionDuration()
+				wf.Status.Tasks[ti].Actions[ai].Message = req.GetMessage().GetMessage()
+
+				// 4. Write the updated workflow
+				if req.GetActionState() != proto.ActionStatusRequest_SUCCESS {
+					wf.Status.State = wf.Status.Tasks[ti].Actions[ai].State
+				}
+				if len(wf.Status.Tasks) == ti+1 && len(task.Actions) == ai+1 && req.GetActionState() == proto.ActionStatusRequest_SUCCESS {
+					// This is the last action in the last task
+					wf.Status.State = tinkerbell.WorkflowStatePost
+				}
+
+				// update the status current state
+				wf.Status.CurrentState = &tinkerbell.CurrentState{
+					AgentID:    req.GetAgentId(),
+					TaskID:     req.GetTaskId(),
+					ActionID:   req.GetActionId(),
+					State:      wf.Status.Tasks[ti].Actions[ai].State,
+					ActionName: req.GetActionName(),
+					TaskName:   wf.Status.Tasks[ti].Name,
+				}
+				if err := h.Backend.UpdateWorkflow(ctx, wf, data.UpdateOptions{StatusOnly: true}); err != nil {
+					code := codes.Internal
+					if apierrors.IsConflict(err) {
+						code = codes.Aborted
+					}
+					return nil, status.Errorf(code, "error writing report status: %v", err)
+				}
+				return &proto.ActionStatusResponse{}, nil
+			}
+		}
+	}
+
+	return nil, status.Error(codes.NotFound, "action not found")
+}
+
+// resolveAndAnnotateHardware resolves the Hardware object for a Workflow and persists agent attributes
+// as a legacy annotation. This is only called on the very first action of the Workflow's first Task to
+// avoid unnecessary backend reads; see updateHardwareWithAttributes for why the annotation, once set, is
+// never refreshed by later Workflow runs. The resolved Hardware is returned so callers that need it again
+// in the same request (e.g. for status.attributes.inBand) don't have to re-read it from the backend.
+func (h *Handler) resolveAndAnnotateHardware(ctx context.Context, log logr.Logger, hwRef *tinkerbell.Hardware, hardwareRef, namespace string, attrs *data.AgentAttributes) *tinkerbell.Hardware {
+	if attrs == nil {
+		return hwRef
+	}
+	hwRef = h.resolveHardware(ctx, hwRef, hardwareRef, namespace)
+	if hwRef == nil {
+		return nil
+	}
+	if err := h.updateHardwareWithAttributes(ctx, log, hwRef, attrs); err != nil {
+		journal.Log(ctx, "error updating Hardware with attributes", "error", err)
+		log.Error(err, "error updating Hardware with attributes")
+	}
+	return hwRef
+}
+
+// updateHardwareWithAttributes updates the Hardware with the given attributes annotation if it doesn't already have it.
+// It uses a merge-patch (rather than a full update) to avoid conflicts with other controllers that may be
+// modifying the same Hardware object concurrently (e.g. the workflow controller toggling allowPXE).
+func (h *Handler) updateHardwareWithAttributes(ctx context.Context, log logr.Logger, hw *tinkerbell.Hardware, attrs *data.AgentAttributes) error {
+	if hw == nil || attrs == nil || hw.Annotations[constant.AttributesAnnotation] != "" {
+		return nil
+	}
+
+	// Take a snapshot before mutation so the backend can compute a minimal merge-patch.
+	original := hw.DeepCopy()
+
+	if hw.Annotations == nil {
+		hw.Annotations = make(map[string]string)
+	}
+
+	a, err := json.Marshal(attrs)
+	if err != nil {
+		return fmt.Errorf("error marshaling attributes for annotation: %w", err)
+	}
+	if len(a) > maxAnnotationSize {
+		return fmt.Errorf("agent attributes annotation exceeds %dKB limit (%d bytes)", maxAnnotationSize/1024, len(a))
+	}
+
+	hw.Annotations[constant.AttributesAnnotation] = string(a)
+	if err := h.Backend.UpdateHardware(ctx, hw, data.UpdateOptions{PatchFrom: original}); err != nil {
+		return fmt.Errorf("error updating Hardware with attributes annotation: %w", err)
+	}
+
+	journal.Log(ctx, "updated Hardware with attributes annotation", "hardware", hw.Name)
+	log.Info("updated Hardware with attributes annotation", "hardware", hw.Name)
+
+	return nil
+}
+
+// resolveAndApplyInBandAttributes resolves the Hardware object for a Workflow and applies the calling
+// Agent's attributes to status.attributes.inBand, but only when the calling Agent is the Hardware's own
+// Agent (hw.Spec.AgentID) - other Agents used by the Workflow (e.g. an administrative Agent handling
+// network or Netbox tasks) don't run on the target Hardware and would otherwise overwrite its in-band
+// attributes with unrelated data. Unlike the legacy annotation, this is applied every time a matching
+// Agent reports in, regardless of any existing value, so Hardware changes or a Tink Agent update are
+// reflected on the next report rather than being permanently masked by the first one ever recorded.
+func (h *Handler) resolveAndApplyInBandAttributes(ctx context.Context, log logr.Logger, hwRef *tinkerbell.Hardware, hardwareRef, namespace, agentID string, attrs *data.AgentAttributes) {
+	if attrs == nil {
+		return
+	}
+	hwRef = h.resolveHardware(ctx, hwRef, hardwareRef, namespace)
+	if hwRef == nil || hwRef.Spec.AgentID != agentID {
+		return
+	}
+	// inBandAttributesFromAgent(attrs) only returns nil when attrs is nil, already
+	// ruled out by the guard above, so inBand is always non-nil here.
+	inBand := inBandAttributesFromAgent(attrs)
+	// Convert first, normalize second. This removes empty '{}' components from showing up in the Kubernetes API, which would otherwise be serialized as present but empty rather than absent.
+	inBand.PruneEmpty()
+	inBand.CollectionMethod = "agent"
+	inBand.LastUpdated = &metav1.Time{Time: h.NowFunc()}
+	if err := h.Backend.ApplyHardwareInBandAttributes(ctx, hwRef.Name, hwRef.Namespace, inBand); err != nil {
+		journal.Log(ctx, "error applying Hardware status.attributes.inBand", "error", err)
+		log.Error(err, "error applying Hardware status.attributes.inBand")
+	}
+}
+
+// resolveHardware returns hwRef unchanged if already resolved, otherwise reads it from the backend.
+func (h *Handler) resolveHardware(ctx context.Context, hwRef *tinkerbell.Hardware, hardwareRef, namespace string) *tinkerbell.Hardware {
+	if hwRef != nil {
+		return hwRef
+	}
+	if hardwareRef == "" {
+		return nil
+	}
+	hw, err := h.Backend.ReadHardware(ctx, hardwareRef, namespace)
+	if err != nil {
+		return nil
+	}
+	return hw
+}
+
+func toPtr[T any](v T) *T {
+	return &v
+}

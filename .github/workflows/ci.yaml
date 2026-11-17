@@ -1,0 +1,228 @@
+name: For each commit and PR
+# Release tags run release.yaml instead.
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+
+# Jobs that publish declare the extra permissions they need. A job-level
+# block replaces this one, so it must also grant contents (read or write).
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+  CGO_ENABLED: 0
+
+# Actions, here and in .github/actions, are pinned by commit SHA, with the
+# version in a comment, so a moved tag cannot change what runs next to the
+# publishing and signing credentials. Dependabot updates the pins.
+#
+# What runs when:
+#
+#   job                       PR   main
+#   validation                x    x
+#   validate-helm-chart       x    x
+#   build (build.yaml)        x    x
+#   build-container-images    x
+#   version                        x
+#   publish (publish.yaml)         x*
+#   sign                           x*
+#
+#   * Unless the commit carries a release tag: its release.yaml run publishes
+#     it (script/publish-version.sh). These jobs gate on version's publish
+#     output.
+#
+# Artifacts carry binaries between jobs, but any job in the run can replace an
+# artifact. Only a job can set its own outputs, so the jobs that build or push
+# something output its checksums or digest, and the jobs that publish, sign or
+# attest use those outputs, never what came with a download. A matrix leg sets
+# only its own outputs, so the legs don't overwrite each other.
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up the Go build
+        uses: ./.github/actions/setup-go-build
+        with:
+          cache-name: validation
+
+      - name: Run all CI checks, linting, tests, etc
+        run: make ci TEST_ARGS="-count=1"
+
+      - name: Save Go cache
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: ./.github/actions/save-go-cache
+        with:
+          cache-name: validation
+          save-module-cache: true
+
+      # After the cache save, so the third-party uploader cannot change the
+      # cache entry this job saves. Release artifacts don't depend on the
+      # cache: release.yaml builds without it.
+      - name: upload to codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  validate-helm-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: install helm
+        uses: Azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: v4.3.1
+
+      - name: Lint and test Helm chart
+        run: make helm-lint helm-test
+
+  # Decides, once per run, the version the publishing jobs publish and whether
+  # they publish (script/publish-version.sh).
+  version:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          cache: false
+
+      - name: Decide the version to publish
+        id: version
+        run: ./script/publish-version.sh
+
+  build:
+    uses: ./.github/workflows/build.yaml
+
+  build-container-images:
+    runs-on: ${{ matrix.runs-on }}
+    if: github.event_name == 'pull_request'
+    needs:
+      - validation
+      - build
+    strategy:
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            artifact_name: tinkerbell-binaries
+            make-target: image
+            cache_image: ghcr.io/tinkerbell/tinkerbell:latest
+          - runs-on: ubuntu-latest
+            artifact_name: tink-agent-binaries
+            make-target: image-agent
+            cache_image: ghcr.io/tinkerbell/tink-agent:latest
+          - runs-on: ubuntu-24.04-arm
+            artifact_name: tinkerbell-binaries
+            make-target: image
+            cache_image: ghcr.io/tinkerbell/tinkerbell:latest
+          - runs-on: ubuntu-24.04-arm
+            artifact_name: tink-agent-binaries
+            make-target: image-agent
+            cache_image: ghcr.io/tinkerbell/tink-agent:latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # `make image` / `make image-agent` depend on `third-party-licenses`,
+      # which invokes `go-licenses` (and transitively `go list`). Go must be
+      # at least the version declared in go.mod (>= 1.25.7) or `go list`
+      # rejects the module.
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          cache: false
+
+      - name: Download binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ./out
+          merge-multiple: true
+      # Artifact upload doesn't preserve permissions so we need to fix them.
+      - name: Fix permissions
+        run: chmod +x out/*
+
+      - name: Pull cache image
+        run: docker pull ${{ matrix.cache_image }} || true
+
+      # Packages the binaries downloaded from build; the image targets don't
+      # compile.
+      - name: Build container image
+        run: make ${{ matrix.make-target }}
+        env:
+          DOCKER_CACHE_FROM: ${{ matrix.cache_image }}
+
+  publish:
+    permissions:
+      contents: read
+      packages: write
+    if: needs.version.outputs.publish == 'true'
+    needs:
+      - version
+      - validation
+      - validate-helm-chart
+      - build
+    uses: ./.github/workflows/publish.yaml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      sha256sums-tinkerbell: ${{ needs.build.outputs.sha256sums-tinkerbell }}
+      sha256sums-tink-agent: ${{ needs.build.outputs.sha256sums-tink-agent }}
+
+  # Holds the OIDC token that signs as this workflow. It runs checkout and the
+  # sign action (cosign-installer and cosign, plus jq and docker buildx
+  # imagetools from the runner image), and signs only digests from outputs.
+  sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # cosign pushes the signatures next to the images and the chart.
+      packages: write
+      # Keyless cosign signing: the job's OIDC token identifies the workflow.
+      id-token: write
+    if: needs.version.outputs.publish == 'true'
+    needs:
+      - version
+      - publish
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Sign the images and the Helm chart
+        uses: ./.github/actions/sign
+        with:
+          registry: ${{ env.REGISTRY }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          digest-tinkerbell: ${{ needs.publish.outputs.digest-tinkerbell }}
+          digest-tink-agent: ${{ needs.publish.outputs.digest-tink-agent }}
+          digest-chart: ${{ needs.publish.outputs.digest-chart }}

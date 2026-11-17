@@ -1,0 +1,937 @@
+package tinkerbell
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// HardwareState represents the hardware state.
+type HardwareState string
+
+const (
+	// HardwareError represents hardware that is in an error state.
+	HardwareError = HardwareState("Error")
+
+	// HardwareReady represents hardware that is in a ready state.
+	HardwareReady = HardwareState("Ready")
+)
+
+// +kubebuilder:object:root=true
+
+// HardwareList contains a list of Hardware.
+type HardwareList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []Hardware `json:"items"`
+}
+
+// +kubebuilder:subresource:status
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:path=hardware,scope=Namespaced,categories=tinkerbell,singular=hardware,shortName=hw
+// +kubebuilder:storageversion
+// +kubebuilder:printcolumn:JSONPath=".status.state",name=State,type=string
+// +kubebuilder:metadata:labels=clusterctl.cluster.x-k8s.io=
+// +kubebuilder:metadata:labels=clusterctl.cluster.x-k8s.io/move=
+
+// Hardware is the Schema for the Hardware API.
+type Hardware struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   HardwareSpec   `json:"spec,omitempty"`
+	Status HardwareStatus `json:"status,omitempty"`
+}
+
+// HardwareSpec defines the desired state of Hardware.
+type HardwareSpec struct {
+	// AgentID is the unique identifier an Agent uses that is associated with this Hardware.
+	// This is used to identify Hardware during the discovery and enrollment process.
+	// It is typically the MAC address of the primary network interface.
+	AgentID string `json:"agentID,omitempty"`
+
+	// Auto is the configuration for the automatic capabilities.
+	Auto AutoCapabilities `json:"auto,omitempty"`
+
+	// BMCRef contains a relation to a BMC state management type in the same
+	// namespace as the Hardware. This may be used for BMC management by
+	// orchestrators.
+	//+optional
+	BMCRef *corev1.TypedLocalObjectReference `json:"bmcRef,omitempty"`
+
+	//+optional
+	Interfaces []Interface `json:"interfaces,omitempty"`
+
+	// References allows for linking custom resource objects of any kind to this Hardware object.
+	// These are available in Templates for templating. They are referenced by the name of the reference.
+	// For example, given a reference with the name "lvm", you can access it in a template with .references.lvm.
+	//+optional
+	References map[string]Reference `json:"references,omitempty"`
+
+	//+optional
+	// Metadata string `json:"metadata,omitempty"`
+
+	//+optional
+	Metadata *HardwareMetadata `json:"metadata,omitempty"`
+
+	//+optional
+	TinkVersion int64 `json:"tinkVersion,omitempty"`
+
+	//+optional
+	Disks []Disk `json:"disks,omitempty"`
+
+	// Resources represents known resources that are available on a machine.
+	// Resources may be used for scheduling by orchestrators.
+	//+optional
+	Resources map[string]resource.Quantity `json:"resources,omitempty"`
+
+	// UserData is the user data to configure in the hardware's
+	// metadata
+	//+optional
+	UserData *string `json:"userData,omitempty"`
+
+	// VendorData is the vendor data to configure in the hardware's
+	// metadata
+	//+optional
+	VendorData *string `json:"vendorData,omitempty"`
+}
+
+type Reference struct {
+	// Group of the referent.
+	// More info: https://kubernetes.io/docs/reference/using-api/#api-groups
+	// +optional
+	Group string `json:"group,omitempty"`
+
+	// Name of the referent.
+	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+	// +required
+	Name string `json:"name,omitempty"`
+
+	// Namespace of the referent. Leave empty for cluster-scoped resources.
+	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Resource of the referent. Must be the pluralized kind of the referent. Must be all lowercase.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+	// +required
+	Resource string `json:"resource,omitempty"`
+
+	// API version of the referent.
+	// More info: https://kubernetes.io/docs/reference/using-api/#api-versioning
+	// +required
+	Version string `json:"version,omitempty"`
+}
+
+// Interface represents configuration related to a network interface.
+type Interface struct {
+	// Netboot configuration.
+	//+optional
+	Netboot *Netboot `json:"netboot,omitempty"`
+
+	// Isoboot configuration.
+	// +optional
+	Isoboot *Isoboot `json:"isoboot,omitempty"`
+
+	// DHCP configuration.
+	//+optional
+	DHCP *DHCP `json:"dhcp,omitempty"`
+
+	// DisableDHCP disables DHCP for this interface.
+	// +kubebuilder:default=false
+	// +optional
+	DisableDHCP bool `json:"disableDhcp,omitempty"`
+}
+
+// PXELINUX represents PXELinux configuration, for u-boot "pxelinux.cfg" booting.
+// It instructs Smee's TFTP server to serve certain files for PXELinux booting.
+// The main pxelinux.cfg asset (in "extlinux" format; see u-boot's distroboot and bootstd docs) is
+// generated on the fly from a config defined in the PXELINUX struct.
+// Other assets (eg, vmlinuz, initramfs, dtb) are served from Smee's configured TFTP asset directory.
+type PXELINUX struct {
+	// Config, when defined, overrides the default PXELinux config to use for generating the pxelinux.cfg file.
+	// It should be in "extlinux" format, as per u-boot's distroboot and bootstd documentation.
+	// +optional
+	Config string `json:"config,omitempty"`
+}
+
+// RPI represents Raspberry Pi network boot configuration.
+// The RaspberryPi's EEPROM firmware can do its own network booting, without u-boot (PXELinux) or iPXE involved.
+// It does so by prefixing requests to certain filenames with the Pi's serial number.
+// Such serial number is NOT related to the MAC address, and is unique to each Pi.
+// The firmware will send requests to "<SerialNum>/start4.elf" to get 2nd-stage firmware, then for
+// "<SerialNum>/config.txt", and "<SerialNum>/cmdline.txt" when doing network booting.
+// config.txt and cmdline.txt will come directly from the Hardware data (config.txt from ConfigTxt; cmdline.txt
+// from the joined OSIE.KernelParams), while everything else (eg all binaries) will be served after a
+// SerialNum -> FirmwarePath mapping.
+// All this depends on being able to find the Hardware via an IP-address lookup; no lookups are done vs the SerialNum.
+// https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#TFTP_PREFIX
+type RPI struct {
+	// ConfigTxt, when defined, is served as the Raspberry Pi config.txt file content.
+	// When not specified, this route serves no config.txt: the request falls through
+	// to any later route, otherwise resulting in a 404.
+	// +optional
+	ConfigTxt string `json:"configTxt,omitempty"`
+
+	// FirmwarePath, when defined, overrides the default path to firmware files.
+	// This must be coordinated with where Smee serves Raspberry Pi firmware files. See the Smee docs for details.
+	//
+	// This is an internal URI rewrite. The Raspberry Pi will always request files prefixed with its serial number.
+	// This field defines a common backend location for the generic firmware files, which will be used for all other files and binaries.
+	// A Raspberry Pi will still request all files from its serial-number prefix, but Smee will serve files from FirmwarePath when the request path starts with the Pi's serial number.
+	// For example, if FirmwarePath is set to "rpi-firmware", then a request for "<SerialNum>/start4.elf" will be served from "rpi-firmware/start4.elf" in Smee's asset directory.
+	// There are 3 main purposes for this:
+	// 1. avoid having to duplicate firmware files for each Raspberry Pi.
+	// 2. allow each Hardware object to specify a different set of firmware files if needed.
+	// 3. decouple generic firmware files from the, optionally defined, hardware specific config.txt and cmdline.txt files.
+	// +optional
+	FirmwarePath string `json:"firmwarePath,omitempty"`
+
+	// SerialNum is the Raspberry Pi's serial number.
+	// This can be the full serial number or just the last 8 characters.
+	// To use any of the fields in the RPI struct, SerialNum must be specified to allow Smee to associate this configuration with the correct Raspberry Pi.
+	// +required
+	SerialNum string `json:"serialNum"`
+}
+
+// Netboot configuration.
+type Netboot struct {
+	//+optional
+	AllowPXE *bool `json:"allowPXE,omitempty"`
+
+	//+optional
+	AllowWorkflow *bool `json:"allowWorkflow,omitempty"`
+
+	//+optional
+	IPXE *IPXE `json:"ipxe,omitempty"`
+
+	//+optional
+	OSIE *OSIE `json:"osie,omitempty"`
+
+	//+optional
+	PXELINUX *PXELINUX `json:"pxelinux,omitempty"`
+
+	//+optional
+	RPI *RPI `json:"rpi,omitempty"`
+}
+
+// Isoboot configuration for booting a client using an ISO image.
+type Isoboot struct {
+	// SourceISO is the source url where HookOS, an Operating System Installation Environment (OSIE), ISO lives.
+	// It must be a valid url.URL{} object and must have a url.URL{}.Scheme of HTTP or HTTPS.
+	//+optional
+	// +kubebuilder:validation:Format=uri
+	SourceISO string `json:"sourceISO,omitempty"`
+}
+
+// IPXE configuration.
+type IPXE struct {
+	URL      string `json:"url,omitempty"`
+	Contents string `json:"contents,omitempty"`
+	// Binary, when defined, overrides Smee's default mapping of architecture to iPXE binary.
+	// The following binary names are supported:
+	// - undionly.kpxe
+	// - ipxe.efi
+	// - snp-arm64.efi
+	// - snp-x86_64.efi
+	// See the iPXE Architecture Mapping documentation for more details.
+	Binary string `json:"binary,omitempty"`
+}
+
+// OSIE (Operating System Installation Environment) configuration.
+type OSIE struct {
+	BaseURL string `json:"baseURL,omitempty"`
+	Kernel  string `json:"kernel,omitempty"`
+	Initrd  string `json:"initrd,omitempty"`
+
+	// KernelParams, when defined, overrides the default kernel parameters passed to the kernel
+	// command line when launching the OSIE. Typically they will be in the format "key=value" and
+	// align with the Linux Kernel and OSIE documentation, but they can be any string.
+	// Also used as the source for RaspberryPi-Netboot cmdline.txt (joined with spaces).
+	// +optional
+	KernelParams []string `json:"kernelParams,omitempty"`
+}
+
+// DHCP configuration.
+// +kubebuilder:validation:XValidation:rule=(has(self.tftp_server_name) && self.tftp_server_name != "") == (has(self.boot_file_name) && self.boot_file_name != ""),message="TFTPServerName and BootFileName must both be specified or both be empty"
+type DHCP struct {
+	// +kubebuilder:validation:Pattern="([0-9a-f]{2}[:]){5}([0-9a-f]{2})"
+	MAC         string   `json:"mac,omitempty"`
+	Hostname    string   `json:"hostname,omitempty"`
+	DomainName  string   `json:"domain_name,omitempty"`
+	LeaseTime   int64    `json:"lease_time,omitempty"`
+	NameServers []string `json:"name_servers,omitempty"`
+	TimeServers []string `json:"time_servers,omitempty"`
+	Arch        string   `json:"arch,omitempty"`
+	UEFI        bool     `json:"uefi,omitempty"`
+	IfaceName   string   `json:"iface_name,omitempty"`
+	IP          *IP      `json:"ip,omitempty"`
+	// validation pattern for VLANDID is a string number between 0-4096
+	// +kubebuilder:validation:Pattern="^(([0-9][0-9]{0,2}|[1-3][0-9][0-9][0-9]|40([0-8][0-9]|9[0-6]))(,[1-9][0-9]{0,2}|[1-3][0-9][0-9][0-9]|40([0-8][0-9]|9[0-6]))*)$"
+	VLANID string `json:"vlan_id,omitempty"`
+	// ClasslessStaticRoutes defines static routes to be sent via DHCP option 121 (RFC 3442).
+	//+optional
+	ClasslessStaticRoutes []ClasslessStaticRoute `json:"classless_static_routes,omitempty"`
+	// TFTPServerName is the TFTP server name or IP address (DHCP option 66).
+	// Used for explicit TFTP server configuration, required by some network boot clients
+	// like NVIDIA NVOS switches.
+	// If specified, BootFileName must also be specified.
+	//+optional
+	TFTPServerName string `json:"tftp_server_name,omitempty"`
+	// BootFileName is the boot file name (DHCP option 67).
+	// Used for explicit boot file configuration, required by some network boot clients
+	// like NVIDIA NVOS switches.
+	// If specified, TFTPServerName must also be specified.
+	//+optional
+	BootFileName string `json:"boot_file_name,omitempty"`
+}
+
+// IP configuration.
+type IP struct {
+	Address string `json:"address,omitempty"`
+	Netmask string `json:"netmask,omitempty"`
+	Gateway string `json:"gateway,omitempty"`
+	Family  int64  `json:"family,omitempty"`
+}
+
+// ClasslessStaticRoute represents a classless static route for DHCP option 121 (RFC 3442).
+type ClasslessStaticRoute struct {
+	// DestinationDescriptor is the network address and prefix length.
+	// The format is "network/prefixlength", e.g., "192.168.1.0/24" or "10.0.0.0/8".
+	// +kubebuilder:validation:Pattern=`^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/(3[0-2]|[12]?[0-9])$`
+	DestinationDescriptor string `json:"destination_descriptor"`
+	// Router is the IP address of the router for this route.
+	// +kubebuilder:validation:Pattern=`^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$`
+	Router string `json:"router"`
+}
+
+type HardwareMetadata struct {
+	State        string                `json:"state,omitempty"`
+	BondingMode  int64                 `json:"bonding_mode,omitempty"`
+	Manufacturer *MetadataManufacturer `json:"manufacturer,omitempty"`
+	Instance     *MetadataInstance     `json:"instance,omitempty"`
+	Custom       *MetadataCustom       `json:"custom,omitempty"`
+	Facility     *MetadataFacility     `json:"facility,omitempty"`
+	// OSIEFiles, when defined, is the set of additional files to be made available to the OSIE (Operating System Installation Environment).
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:XValidation:rule="self.all(a, self.exists_one(b, (b.path.startsWith('/') ? b.path.substring(1) : b.path) == (a.path.startsWith('/') ? a.path.substring(1) : a.path)))",message="osieFiles paths must be unique"
+	// +kubebuilder:validation:XValidation:rule="self.all(a, !self.exists(b, (b.path.startsWith('/') ? b.path.substring(1) : b.path).startsWith((a.path.startsWith('/') ? a.path.substring(1) : a.path) + '/')))",message="an osieFiles path must not be the parent directory of another"
+	// +optional
+	OSIEFiles []OSIEFile `json:"osieFiles,omitempty"`
+}
+
+// OSIEFile represents a file to be made available to the OSIE (Operating System Installation Environment).
+// All files are relative to the default /osie_files directory in the OSIE (Operating System Installation Environment).
+type OSIEFile struct {
+	// Path is the file path where the file should be made available within the default /osie_files directory in the OSIE (Operating System Installation Environment).
+	// A leading "/" is ignored. Empty, "." and ".." segments are not allowed.
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^/?[^/]+(/[^/]+)*$`
+	// +kubebuilder:validation:XValidation:rule="!self.split('/').exists(s, s == '.' || s == '..')",message="path must not contain '.' or '..' segments"
+	// +required
+	Path string `json:"path"`
+
+	// Contents is the contents of the file.
+	// +optional
+	Contents string `json:"contents"`
+
+	// Mode is the file's permission bits as an octal string, e.g. "0644", "644" or "0o644".
+	// Only permission bits are allowed (max "0777"); setuid, setgid and sticky bits are rejected.
+	// Symbolic forms like "rw-r--r--" and decimal values are invalid.
+	// Omitted or "0" means the default, "0400" (read-only for the owner).
+	// +kubebuilder:validation:MaxLength=8
+	// +kubebuilder:validation:Pattern=`^(0[oO])?0*[0-7]{1,3}$`
+	// +optional
+	Mode string `json:"mode,omitempty"`
+}
+
+type MetadataManufacturer struct {
+	ID   string `json:"id,omitempty"`
+	Slug string `json:"slug,omitempty"`
+}
+
+type MetadataInstance struct {
+	ID                  string                           `json:"id,omitempty"`
+	State               string                           `json:"state,omitempty"`
+	Hostname            string                           `json:"hostname,omitempty"`
+	AllowPxe            bool                             `json:"allow_pxe,omitempty"`
+	Rescue              bool                             `json:"rescue,omitempty"`
+	OperatingSystem     *MetadataInstanceOperatingSystem `json:"operating_system,omitempty"`
+	AlwaysPxe           bool                             `json:"always_pxe,omitempty"`
+	IpxeScriptURL       string                           `json:"ipxe_script_url,omitempty"`
+	Ips                 []*MetadataInstanceIP            `json:"ips,omitempty"`
+	Userdata            string                           `json:"userdata,omitempty"`
+	CryptedRootPassword string                           `json:"crypted_root_password,omitempty"`
+	Tags                []string                         `json:"tags,omitempty"`
+	Storage             *MetadataInstanceStorage         `json:"storage,omitempty"`
+	SSHKeys             []string                         `json:"ssh_keys,omitempty"`
+	NetworkReady        bool                             `json:"network_ready,omitempty"`
+}
+
+type MetadataInstanceOperatingSystem struct {
+	Slug     string `json:"slug,omitempty"`
+	Distro   string `json:"distro,omitempty"`
+	Version  string `json:"version,omitempty"`
+	ImageTag string `json:"image_tag,omitempty"`
+	OsSlug   string `json:"os_slug,omitempty"`
+}
+
+type MetadataInstanceIP struct {
+	Address    string `json:"address,omitempty"`
+	Netmask    string `json:"netmask,omitempty"`
+	Gateway    string `json:"gateway,omitempty"`
+	Family     int64  `json:"family,omitempty"`
+	Public     bool   `json:"public,omitempty"`
+	Management bool   `json:"management,omitempty"`
+}
+
+type MetadataInstanceStorage struct {
+	Disks       []*MetadataInstanceStorageDisk       `json:"disks,omitempty"`
+	Raid        []*MetadataInstanceStorageRAID       `json:"raid,omitempty"`
+	Filesystems []*MetadataInstanceStorageFilesystem `json:"filesystems,omitempty"`
+}
+
+type MetadataInstanceStorageDisk struct {
+	Device     string                                  `json:"device,omitempty"`
+	WipeTable  bool                                    `json:"wipe_table,omitempty"`
+	Partitions []*MetadataInstanceStorageDiskPartition `json:"partitions,omitempty"`
+}
+
+type MetadataInstanceStorageDiskPartition struct {
+	Label    string `json:"label,omitempty"`
+	Number   int64  `json:"number,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	Start    int64  `json:"start,omitempty"`
+	TypeGUID string `json:"type_guid,omitempty"`
+}
+
+type MetadataInstanceStorageRAID struct {
+	Name    string   `json:"name,omitempty"`
+	Level   string   `json:"level,omitempty"`
+	Devices []string `json:"devices,omitempty"`
+	Spare   int64    `json:"spare,omitempty"`
+}
+
+type MetadataInstanceStorageFilesystem struct {
+	Mount *MetadataInstanceStorageMount `json:"mount,omitempty"`
+}
+
+type MetadataInstanceStorageMount struct {
+	Device string                                         `json:"device,omitempty"`
+	Format string                                         `json:"format,omitempty"`
+	Files  []*MetadataInstanceStorageFile                 `json:"files,omitempty"`
+	Create *MetadataInstanceStorageMountFilesystemOptions `json:"create,omitempty"`
+	Point  string                                         `json:"point,omitempty"`
+}
+
+type MetadataInstanceStorageFile struct {
+	Path     string `json:"path,omitempty"`
+	Contents string `json:"contents,omitempty"`
+	Mode     int64  `json:"mode,omitempty"`
+	UID      int64  `json:"uid,omitempty"`
+	GID      int64  `json:"gid,omitempty"`
+}
+
+type MetadataInstanceStorageMountFilesystemOptions struct {
+	Force   bool     `json:"force,omitempty"`
+	Options []string `json:"options,omitempty"`
+}
+
+type MetadataCustom struct {
+	PreinstalledOperatingSystemVersion *MetadataInstanceOperatingSystem `json:"preinstalled_operating_system_version,omitempty"`
+	PrivateSubnets                     []string                         `json:"private_subnets,omitempty"`
+}
+
+type MetadataFacility struct {
+	PlanSlug        string `json:"plan_slug,omitempty"`
+	PlanVersionSlug string `json:"plan_version_slug,omitempty"`
+	FacilityCode    string `json:"facility_code,omitempty"`
+}
+
+// Disk represents a disk device for Tinkerbell Hardware.
+type Disk struct {
+	//+optional
+	Device string `json:"device,omitempty"`
+}
+
+// HardwareStatus defines the observed state of Hardware.
+type HardwareStatus struct {
+	//+optional
+	State HardwareState `json:"state,omitempty"`
+
+	// Attributes describes the hardware itself, as observed by Tinkerbell. It is
+	// split by collection path rather than merged, so each collector owns a
+	// disjoint subtree and neither can clobber the other.
+	//+optional
+	Attributes *HardwareAttributes `json:"attributes,omitempty"`
+}
+
+// HardwareAttributes holds hardware attribute subtrees, one per collection path.
+// Each subtree is written by a single owner and the owners touch disjoint paths,
+// so no merge keys or per-field precedence rules are needed.
+type HardwareAttributes struct {
+	// OutOfBand holds attributes collected via the BMC (Redfish or vendor API).
+	// Available before the machine boots. IPMI-only BMCs cannot provide this data
+	// and will not populate this field.
+	//+optional
+	OutOfBand *Attributes `json:"outOfBand,omitempty"`
+
+	// InBand holds attributes reported by the Tink Agent from within the running
+	// OS. Only available once the machine has booted and the Agent has checked
+	// in; unlike OutOfBand, it cannot see hardware the OS doesn't expose (e.g. the
+	// BMC's own firmware, PSUs) but can see hardware the BMC doesn't (e.g. the PCI
+	// bus, loaded drivers).
+	//+optional
+	InBand *Attributes `json:"inBand,omitempty"`
+}
+
+// Attributes is a source-agnostic description of a machine's hardware, shared by
+// both the out-of-band and in-band collection paths. It is the superset of what
+// either can report: every field is optional, and an absent field means the
+// producing source did not report it, not an error. Field coverage varies by
+// source, and for the out-of-band path also by BMC vendor/protocol. Fields only
+// one source can populate are marked as such.
+type Attributes struct {
+	// LastUpdated is the time at which this subtree was last refreshed.
+	//+optional
+	LastUpdated *metav1.Time `json:"lastUpdated,omitempty"`
+
+	// CollectionMethod identifies what produced this subtree: "agent" for in-band,
+	// or the bmclib driver for out-of-band (e.g. "redfish", "dell", "supermicro",
+	// "asrockrack", "openbmc"). Consumers should use this to interpret absent
+	// fields rather than treating them as errors.
+	//+optional
+	CollectionMethod string `json:"collectionMethod,omitempty"`
+
+	// CPU holds aggregate CPU totals and per-socket detail. Both in-band and
+	// out-of-band report sockets; CPUSocket.Slot is a numeric processor ID
+	// in-band and a physical socket label (e.g. "CPU1") out-of-band.
+	//+optional
+	CPU *CPU `json:"cpu,omitempty"`
+
+	// Memory holds aggregate memory totals and per-module detail. In-band reports
+	// the totals; out-of-band reports the modules.
+	//+optional
+	Memory *Memory `json:"memory,omitempty"`
+
+	// BlockDevices lists storage drives.
+	//+optional
+	BlockDevices []BlockDevice `json:"blockDevices,omitempty"`
+
+	// NetworkInterfaces lists the host's network adapters. Distinct from
+	// Hardware.spec.interfaces, which is DHCP/netboot configuration rather than
+	// observed hardware.
+	//+optional
+	NetworkInterfaces []NetworkInterface `json:"networkInterfaces,omitempty"`
+
+	// GPUDevices lists GPU and accelerator devices.
+	//+optional
+	GPUDevices []GPUDevice `json:"gpuDevices,omitempty"`
+
+	// PCIDevices lists PCI devices. In-band only: enumerating the PCI bus requires
+	// a running OS.
+	//+optional
+	PCIDevices []PCIDevice `json:"pciDevices,omitempty"`
+
+	// Chassis describes the enclosure.
+	//+optional
+	Chassis *Chassis `json:"chassis,omitempty"`
+
+	// Baseboard describes the mainboard/motherboard.
+	//+optional
+	Baseboard *Baseboard `json:"baseboard,omitempty"`
+
+	// BIOS describes the system BIOS firmware.
+	//+optional
+	BIOS *BIOS `json:"bios,omitempty"`
+
+	// Product describes the overall system identity — the machine's own asset
+	// details, distinct from any individual component.
+	//+optional
+	Product *Product `json:"product,omitempty"`
+
+	// BMC describes the BMC's own firmware and management NIC. Out-of-band only.
+	//+optional
+	BMC *BMC `json:"bmc,omitempty"`
+
+	// PSUs lists power supply units. Out-of-band only.
+	//+optional
+	PSUs []PSU `json:"psus,omitempty"`
+
+	// TPMs lists trusted platform modules. Out-of-band only.
+	//+optional
+	TPMs []TPM `json:"tpms,omitempty"`
+
+	// StorageControllers lists storage controllers. Out-of-band only.
+	//+optional
+	StorageControllers []StorageController `json:"storageControllers,omitempty"`
+}
+
+// CPU holds aggregate CPU totals plus per-socket detail.
+type CPU struct {
+	//+optional
+	TotalCores uint32 `json:"totalCores,omitempty"`
+	//+optional
+	TotalThreads uint32 `json:"totalThreads,omitempty"`
+	// Sockets lists the individual physical CPUs.
+	//+optional
+	Sockets []CPUSocket `json:"sockets,omitempty"`
+}
+
+// CPUSocket describes a single physical CPU. Note: on the out-of-band Redfish
+// collection path, SerialNumber is always empty — that is what the BMC exposes,
+// not a mapping gap.
+type CPUSocket struct {
+	// Slot identifies the physical socket (e.g. "CPU1").
+	//+optional
+	Slot string `json:"slot,omitempty"`
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	Cores uint32 `json:"cores,omitempty"`
+	//+optional
+	Threads uint32 `json:"threads,omitempty"`
+	//+optional
+	ClockSpeedMHz uint32 `json:"clockSpeedMHz,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	// Capabilities lists CPU feature flags. In-band only.
+	//+optional
+	Capabilities []string `json:"capabilities,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+}
+
+// Memory holds aggregate memory totals plus per-module detail.
+type Memory struct {
+	// TotalBytes is the total physical memory installed.
+	//+optional
+	TotalBytes int64 `json:"totalBytes,omitempty"`
+	// UsableBytes is the memory usable by the OS. In-band only.
+	//+optional
+	UsableBytes int64 `json:"usableBytes,omitempty"`
+	// Modules lists the individual memory modules. Out-of-band only: the physical
+	// DIMM topology is not visible from inside the OS.
+	//+optional
+	Modules []MemoryModule `json:"modules,omitempty"`
+}
+
+// MemoryModule describes a single memory module. Note: on the out-of-band Redfish
+// collection path, Model is always empty — that is what the BMC exposes.
+type MemoryModule struct {
+	// Slot identifies the physical slot (e.g. "DIMM.A1").
+	//+optional
+	Slot string `json:"slot,omitempty"`
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	//+optional
+	PartNumber string `json:"partNumber,omitempty"`
+	//+optional
+	SizeBytes int64 `json:"sizeBytes,omitempty"`
+	//+optional
+	SpeedMHz uint32 `json:"speedMHz,omitempty"`
+	//+optional
+	FormFactor string `json:"formFactor,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+}
+
+// BlockDevice describes a storage drive.
+type BlockDevice struct {
+	// Name is the OS-visible device name (e.g. "nvme0n1"). In-band only.
+	//+optional
+	Name string `json:"name,omitempty"`
+	//+optional
+	ControllerType string `json:"controllerType,omitempty"`
+	//+optional
+	DriveType string `json:"driveType,omitempty"`
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	// WWN is the World Wide Name, a standard unique storage identifier. Where both
+	// sources report a drive, this is the key they can be joined on.
+	//+optional
+	WWN string `json:"wwn,omitempty"`
+	// Path is the device's position in the topology (udev ID_PATH, e.g.
+	// "pci-0000:17:00.0-nvme-1"), i.e. /dev/disk/by-path/<path>. Stable where Name
+	// is not, and identifies the slot rather than the drive: WWN and SerialNumber
+	// identify the drive, Path the port it is attached to. In-band only.
+	//+optional
+	Path string `json:"path,omitempty"`
+	//+optional
+	SizeBytes int64 `json:"sizeBytes,omitempty"`
+	//+optional
+	PhysicalBlockSizeBytes int64 `json:"physicalBlockSizeBytes,omitempty"`
+	// SmartStatus is the drive's self-reported SMART health status (e.g. "ok",
+	// "predict-failure"). Out-of-band only.
+	//+optional
+	SmartStatus string `json:"smartStatus,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	//+optional
+	Status *ComponentStatus `json:"status,omitempty"`
+}
+
+// NetworkInterface describes a network adapter and its ports.
+type NetworkInterface struct {
+	// Name is the OS-visible interface name (e.g. "eno1"). In-band only.
+	//+optional
+	Name string `json:"name,omitempty"`
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	// Ports lists the physical ports on this adapter. The in-band collector reports
+	// one port per interface; the out-of-band collector groups ports under the
+	// adapter that carries them.
+	//+optional
+	Ports []NetworkPort `json:"ports,omitempty"`
+}
+
+// NetworkPort describes a single physical port on a network adapter.
+type NetworkPort struct {
+	// PortID identifies the port as the BMC names it (e.g. "NIC.Embedded.1").
+	// Out-of-band only.
+	//+optional
+	PortID string `json:"portID,omitempty"`
+	// MAC is the port's hardware address. Where both sources report a port, this is
+	// the key they can be joined on.
+	//+optional
+	MAC string `json:"mac,omitempty"`
+	//+optional
+	SpeedMbps uint32 `json:"speedMbps,omitempty"`
+	//+optional
+	MTU uint32 `json:"mtu,omitempty"`
+	//+optional
+	LinkStatus string `json:"linkStatus,omitempty"`
+	// EnabledCapabilities lists enabled offloads and features. In-band only.
+	//+optional
+	EnabledCapabilities []string `json:"enabledCapabilities,omitempty"`
+
+	// LLDPNeighbors lists every neighbor advertising to this port over LLDP; a
+	// port can see more than one (e.g. a switch plus a hypervisor vSwitch or a
+	// daisy-chained device). In-band only: this comes from passively listening
+	// on the wire, not from the BMC.
+	//+optional
+	LLDPNeighbors []LLDPNeighbor `json:"lldpNeighbors,omitempty"`
+}
+
+// LLDPNeighbor describes the switch (or other LLDP-speaking device) discovered
+// on the other end of a NetworkPort.
+type LLDPNeighbor struct {
+	// ChassisID identifies the neighbor's chassis, format depending on what the
+	// neighbor advertises (e.g. a MAC address).
+	//+optional
+	ChassisID string `json:"chassisID,omitempty"`
+	// SystemName is the neighbor's advertised hostname (e.g. the switch name).
+	//+optional
+	SystemName string `json:"systemName,omitempty"`
+	// PortID identifies the neighbor's port that this port is connected to, as
+	// the neighbor names it (e.g. a switch port name).
+	//+optional
+	PortID string `json:"portID,omitempty"`
+	// PortDescription is the neighbor's description of that port (e.g. an
+	// interface alias configured on the switch).
+	//+optional
+	PortDescription string `json:"portDescription,omitempty"`
+}
+
+// GPUDevice describes a GPU or accelerator device.
+type GPUDevice struct {
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	//+optional
+	Description string `json:"description,omitempty"`
+	// Class is the PCI device class. In-band only.
+	//+optional
+	Class string `json:"class,omitempty"`
+	// Driver is the loaded kernel driver. In-band only.
+	//+optional
+	Driver string `json:"driver,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	//+optional
+	Status *ComponentStatus `json:"status,omitempty"`
+}
+
+// PCIDevice describes a device on the PCI bus. In-band only.
+type PCIDevice struct {
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	Class string `json:"class,omitempty"`
+	//+optional
+	Driver string `json:"driver,omitempty"`
+}
+
+// Chassis describes the enclosure.
+type Chassis struct {
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+}
+
+// Baseboard describes the mainboard/motherboard.
+type Baseboard struct {
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	//+optional
+	Description string `json:"description,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	//+optional
+	Status *ComponentStatus `json:"status,omitempty"`
+}
+
+// BIOS describes the system BIOS firmware.
+type BIOS struct {
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	// ReleaseDate is the BIOS release date as the source reports it, format
+	// unspecified (e.g. "12/13/2021"). In-band only.
+	//+optional
+	ReleaseDate string `json:"releaseDate,omitempty"`
+	//+optional
+	Status *ComponentStatus `json:"status,omitempty"`
+}
+
+// Product describes the overall system identity.
+type Product struct {
+	//+optional
+	Name string `json:"name,omitempty"`
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	//+optional
+	Status *ComponentStatus `json:"status,omitempty"`
+}
+
+// BMC describes the BMC's own firmware and out-of-band management NIC.
+// Out-of-band only.
+type BMC struct {
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	// NIC is the BMC's own management network interface. It is distinct from
+	// Attributes.NetworkInterfaces, which lists the host's NICs.
+	//+optional
+	NIC *NetworkInterface `json:"nic,omitempty"`
+	//+optional
+	Status *ComponentStatus `json:"status,omitempty"`
+}
+
+// PSU describes a power supply unit. Out-of-band only.
+type PSU struct {
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	//+optional
+	Description string `json:"description,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	//+optional
+	PowerCapacityWatts int64 `json:"powerCapacityWatts,omitempty"`
+	//+optional
+	Status *ComponentStatus `json:"status,omitempty"`
+}
+
+// TPM describes a trusted platform module. Out-of-band only.
+type TPM struct {
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	// InterfaceType is the TPM interface (e.g. "TPM2_0").
+	//+optional
+	InterfaceType string `json:"interfaceType,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	//+optional
+	Status *ComponentStatus `json:"status,omitempty"`
+}
+
+// StorageController describes a storage controller. Out-of-band only.
+type StorageController struct {
+	//+optional
+	Vendor string `json:"vendor,omitempty"`
+	//+optional
+	Model string `json:"model,omitempty"`
+	//+optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	//+optional
+	Description string `json:"description,omitempty"`
+	//+optional
+	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	//+optional
+	Status *ComponentStatus `json:"status,omitempty"`
+}
+
+// ComponentStatus is health/state information reported for an individual
+// component. PostCode and PostCodeStatus are device-level POST diagnostics and
+// are only populated on Product (the machine's own identity), never on a
+// per-component status.
+type ComponentStatus struct {
+	//+optional
+	Health string `json:"health,omitempty"`
+	//+optional
+	State string `json:"state,omitempty"`
+	// PostCode is a pointer because 0 is a meaningful POST code (success), which
+	// omitempty on a value type would drop.
+	//+optional
+	PostCode *int32 `json:"postCode,omitempty"`
+	//+optional
+	PostCodeStatus string `json:"postCodeStatus,omitempty"`
+}
+
+// AutoCapabilities defines the configuration for the automatic capabilities of this Hardware.
+type AutoCapabilities struct {
+	// EnrollmentEnabled enables automatic enrollment of the Hardware.
+	// When set to true, auto enrollment will create Workflows for this Hardware.
+	// +kubebuilder:default=false
+	EnrollmentEnabled bool `json:"enrollmentEnabled,omitempty"`
+}

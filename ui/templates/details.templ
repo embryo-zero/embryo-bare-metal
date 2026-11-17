@@ -1,0 +1,1357 @@
+package templates
+
+import "strconv"
+
+// Resource-specific detail content components
+
+templ HardwareDetailContent(hw HardwareDetail, baseURL string) {
+	@MainInfoHeader(hw.Name, "")
+	
+	<!-- Main Info Section -->
+	@SectionBox("Info") {
+		@MetadataTable(hw.Name, hw.Namespace, hw.CreatedAt, hw.Labels, hw.Annotations)
+	}
+	
+	<!-- Network Interfaces -->
+	if len(hw.Interfaces) > 0 {
+		@SectionBox("Network Interfaces") {
+			<div class="overflow-x-auto">
+				<table class="min-w-full">
+					<thead>
+						<tr class="border-b border-gray-200 dark:border-darkBorder">
+							<th class="py-3 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">MAC Address</th>
+							<th class="py-3 text-left text-sm font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">IP Address</th>
+						</tr>
+					</thead>
+					<tbody>
+						for _, iface := range hw.Interfaces {
+							<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+								<td class="py-3 pr-4 text-sm font-mono text-gray-900 dark:text-white whitespace-nowrap">{ iface.MAC }</td>
+								<td class="py-3 text-sm font-mono text-gray-900 dark:text-white whitespace-nowrap">{ iface.IP }</td>
+							</tr>
+						}
+					</tbody>
+				</table>
+			</div>
+		}
+	}
+	
+	<!-- In-Band Attributes -->
+	if hw.AgentAttributes != nil {
+		@SectionBoxCollapsible("In-Band Attributes", true) {
+			<div class="space-y-6">
+				<!-- System Overview -->
+				<div>
+					<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">System Overview</h4>
+					<div class="overflow-x-auto">
+						<table class="min-w-full">
+							<tbody>
+								<tr class="border-b border-gray-100 dark:border-darkBorder">
+									<td class="py-2 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4">CPU Cores</td>
+									<td class="py-2 text-sm text-gray-900 dark:text-white">{ strconv.Itoa(hw.AgentAttributes.CPU.TotalCores) } cores / { strconv.Itoa(hw.AgentAttributes.CPU.TotalThreads) } threads</td>
+								</tr>
+								if hw.AgentAttributes.Memory.Total != "" {
+									<tr class="border-b border-gray-100 dark:border-darkBorder">
+										<td class="py-2 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4">Memory</td>
+										<td class="py-2 text-sm text-gray-900 dark:text-white">{ hw.AgentAttributes.Memory.Total } total / { hw.AgentAttributes.Memory.Usable } usable</td>
+									</tr>
+								}
+								if hw.AgentAttributes.Product.Name != "" || hw.AgentAttributes.Product.Vendor != "" {
+									<tr class="border-b border-gray-100 dark:border-darkBorder">
+										<td class="py-2 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4">Product</td>
+										<td class="py-2 text-sm text-gray-900 dark:text-white">
+											if hw.AgentAttributes.Product.Vendor != "" {
+												{ hw.AgentAttributes.Product.Vendor }
+											}
+											if hw.AgentAttributes.Product.Name != "" {
+												if hw.AgentAttributes.Product.Vendor != "" {
+													<span> </span>
+												}
+												{ hw.AgentAttributes.Product.Name }
+											}
+											if hw.AgentAttributes.Product.SerialNumber != "" {
+												<span class="text-gray-500 dark:text-gray-400"> (S/N: { hw.AgentAttributes.Product.SerialNumber })</span>
+											}
+										</td>
+									</tr>
+								}
+								if hw.AgentAttributes.Chassis.Vendor != "" || hw.AgentAttributes.Chassis.Serial != "" {
+									<tr class="border-b border-gray-100 dark:border-darkBorder">
+										<td class="py-2 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4">Chassis</td>
+										<td class="py-2 text-sm text-gray-900 dark:text-white">
+											if hw.AgentAttributes.Chassis.Vendor != "" {
+												{ hw.AgentAttributes.Chassis.Vendor }
+											}
+											if hw.AgentAttributes.Chassis.Serial != "" {
+												<span class="text-gray-500 dark:text-gray-400"> (Serial: { hw.AgentAttributes.Chassis.Serial })</span>
+											}
+										</td>
+									</tr>
+								}
+								if hw.AgentAttributes.Baseboard.Vendor != "" || hw.AgentAttributes.Baseboard.Product != "" {
+									<tr class="border-b border-gray-100 dark:border-darkBorder">
+										<td class="py-2 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4">Baseboard</td>
+										<td class="py-2 text-sm text-gray-900 dark:text-white">
+											if hw.AgentAttributes.Baseboard.Vendor != "" {
+												{ hw.AgentAttributes.Baseboard.Vendor }
+											}
+											if hw.AgentAttributes.Baseboard.Product != "" {
+												if hw.AgentAttributes.Baseboard.Vendor != "" {
+													<span> </span>
+												}
+												{ hw.AgentAttributes.Baseboard.Product }
+											}
+											if hw.AgentAttributes.Baseboard.Version != "" {
+												<span class="text-gray-500 dark:text-gray-400"> v{ hw.AgentAttributes.Baseboard.Version }</span>
+											}
+											if hw.AgentAttributes.Baseboard.SerialNumber != "" {
+												<span class="text-gray-500 dark:text-gray-400"> (S/N: { hw.AgentAttributes.Baseboard.SerialNumber })</span>
+											}
+										</td>
+									</tr>
+								}
+								if hw.AgentAttributes.BIOS.Vendor != "" || hw.AgentAttributes.BIOS.Version != "" {
+									<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+										<td class="py-2 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4">BIOS</td>
+										<td class="py-2 text-sm text-gray-900 dark:text-white">
+											if hw.AgentAttributes.BIOS.Vendor != "" {
+												{ hw.AgentAttributes.BIOS.Vendor }
+											}
+											if hw.AgentAttributes.BIOS.Version != "" {
+												<span class="text-gray-500 dark:text-gray-400"> v{ hw.AgentAttributes.BIOS.Version }</span>
+											}
+											if hw.AgentAttributes.BIOS.ReleaseDate != "" {
+												<span class="text-gray-500 dark:text-gray-400"> ({ hw.AgentAttributes.BIOS.ReleaseDate })</span>
+											}
+										</td>
+									</tr>
+								}
+							</tbody>
+						</table>
+					</div>
+				</div>
+				
+				<!-- Processors -->
+				if len(hw.AgentAttributes.CPU.Processors) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Processors</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<thead>
+									<tr class="border-b border-gray-200 dark:border-darkBorder">
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">ID</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Model</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Vendor</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Cores</th>
+										<th class="py-2 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Threads</th>
+									</tr>
+								</thead>
+								<tbody>
+									for _, proc := range hw.AgentAttributes.CPU.Processors {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">{ strconv.Itoa(proc.ID) }</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if proc.Model != "" {
+													{ proc.Model }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if proc.Vendor != "" {
+													{ proc.Vendor }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">{ strconv.Itoa(proc.Cores) }</td>
+											<td class="py-2 text-sm text-gray-900 dark:text-white">{ strconv.Itoa(proc.Threads) }</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+				
+				<!-- Block Devices -->
+				if len(hw.AgentAttributes.BlockDevices) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Block Devices</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<thead>
+									<tr class="border-b border-gray-200 dark:border-darkBorder">
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Name</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Size</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Type</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Vendor</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Model</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Path</th>
+										<th class="py-2 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Serial</th>
+									</tr>
+								</thead>
+								<tbody>
+									for _, dev := range hw.AgentAttributes.BlockDevices {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm font-mono text-gray-900 dark:text-white">{ dev.Name }</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if dev.Size != "" {
+													{ dev.Size }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if dev.DriveType != "" {
+													{ dev.DriveType }
+													if dev.ControllerType != "" {
+														<span class="text-gray-500 dark:text-gray-400"> ({ dev.ControllerType })</span>
+													}
+												} else if dev.ControllerType != "" {
+													{ dev.ControllerType }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if dev.Vendor != "" {
+													{ dev.Vendor }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if dev.Model != "" {
+													{ dev.Model }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm font-mono text-gray-900 dark:text-white">
+												if dev.Path != "" {
+													{ dev.Path }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm font-mono text-gray-900 dark:text-white">
+												if dev.SerialNumber != "" {
+													{ dev.SerialNumber }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+				
+				<!-- Network Interfaces from Agent -->
+				if len(hw.AgentAttributes.NetworkInterfaces) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Discovered Network Interfaces</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<thead>
+									<tr class="border-b border-gray-200 dark:border-darkBorder">
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Name</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">MAC Address</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Speed</th>
+										<th class="py-2 text-left text-sm font-medium text-gray-500 dark:text-gray-400">LLDP Neighbors</th>
+									</tr>
+								</thead>
+								<tbody>
+									for _, iface := range hw.AgentAttributes.NetworkInterfaces {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm font-mono text-gray-900 dark:text-white">{ iface.Name }</td>
+											<td class="py-2 pr-4 text-sm font-mono text-gray-900 dark:text-white">{ iface.MAC }</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if iface.Speed != "" {
+													{ iface.Speed }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm text-gray-900 dark:text-white">
+												if len(iface.LLDPNeighbors) > 0 {
+													<div class="space-y-2">
+													for _, nb := range iface.LLDPNeighbors {
+														<div>
+															<div>
+																if nb.SystemName != "" {
+																	<span class="font-medium">{ nb.SystemName }</span>
+																} else {
+																	<span class="font-mono">{ nb.ChassisID }</span>
+																}
+															</div>
+															if nb.PortID != "" {
+																<div class="text-xs text-gray-500 dark:text-gray-400">
+																	port { nb.PortID }
+																	if nb.PortDescription != "" {
+																		({ nb.PortDescription })
+																	}
+																</div>
+															}
+														</div>
+													}
+													</div>
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+				
+				<!-- GPU Devices -->
+				if len(hw.AgentAttributes.GPUDevices) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">GPU Devices</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<thead>
+									<tr class="border-b border-gray-200 dark:border-darkBorder">
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Product</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Vendor</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Class</th>
+										<th class="py-2 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Driver</th>
+									</tr>
+								</thead>
+								<tbody>
+									for _, gpu := range hw.AgentAttributes.GPUDevices {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if gpu.Product != "" {
+													{ gpu.Product }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if gpu.Vendor != "" {
+													{ gpu.Vendor }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if gpu.Class != "" {
+													{ gpu.Class }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm text-gray-900 dark:text-white">
+												if gpu.Driver != "" {
+													{ gpu.Driver }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+				
+				<!-- PCI Devices -->
+				if len(hw.AgentAttributes.PCIDevices) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">PCI Devices</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<thead>
+									<tr class="border-b border-gray-200 dark:border-darkBorder">
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Product</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Vendor</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Class</th>
+										<th class="py-2 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Driver</th>
+									</tr>
+								</thead>
+								<tbody>
+									for _, pci := range hw.AgentAttributes.PCIDevices {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if pci.Product != "" {
+													{ pci.Product }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if pci.Vendor != "" {
+													{ pci.Vendor }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if pci.Class != "" {
+													{ pci.Class }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm text-gray-900 dark:text-white">
+												if pci.Driver != "" {
+													{ pci.Driver }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+			</div>
+		}
+	}
+	
+	if hw.OutOfBand != nil {
+		<!-- Out-of-Band Attributes -->
+		@SectionBoxCollapsible("Out-of-Band Attributes", true) {
+			<div class="space-y-6">
+				<!-- Product -->
+				if hw.OutOfBand.Product.Vendor != "" || hw.OutOfBand.Product.Model != "" || hw.OutOfBand.Product.Name != "" || hw.OutOfBand.Product.SerialNumber != "" {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Product</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+										<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+											if hw.OutOfBand.Product.Vendor != "" {
+												{ hw.OutOfBand.Product.Vendor }
+											}
+											if hw.OutOfBand.Product.Model != "" {
+												<span> { hw.OutOfBand.Product.Model }</span>
+											} else if hw.OutOfBand.Product.Name != "" {
+												<span> { hw.OutOfBand.Product.Name }</span>
+											}
+											if hw.OutOfBand.Product.SerialNumber != "" {
+												<span class="text-gray-500 dark:text-gray-400"> (S/N: { hw.OutOfBand.Product.SerialNumber })</span>
+											}
+											if hw.OutOfBand.Product.Status.Health != "" {
+												<span class="ml-2 text-gray-500 dark:text-gray-400 text-xs">Health:</span>
+												<span class="ml-1">@StatusBadge(hw.OutOfBand.Product.Status.Health)</span>
+											}
+										</td>
+									</tr>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- BIOS -->
+				if hw.OutOfBand.BIOS.FirmwareVersion != "" || hw.OutOfBand.BIOS.ReleaseDate != "" || hw.OutOfBand.BIOS.Status.Health != "" || hw.OutOfBand.BIOS.Status.PostCode != nil {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">BIOS</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+										<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+											if hw.OutOfBand.BIOS.FirmwareVersion != "" {
+												<span class="text-gray-500 dark:text-gray-400">Firmware Version:</span> v{ hw.OutOfBand.BIOS.FirmwareVersion }
+											}
+											if hw.OutOfBand.BIOS.ReleaseDate != "" {
+												<span class="text-gray-500 dark:text-gray-400"> ({ hw.OutOfBand.BIOS.ReleaseDate })</span>
+											}
+											if hw.OutOfBand.BIOS.Status.Health != "" {
+												<span class="ml-2 text-gray-500 dark:text-gray-400 text-xs">Health:</span>
+												<span class="ml-1">@StatusBadge(hw.OutOfBand.BIOS.Status.Health)</span>
+											}
+											if hw.OutOfBand.BIOS.Status.PostCode != nil {
+												<span class="text-gray-500 dark:text-gray-400 ml-2">POST: { strconv.Itoa(int(*hw.OutOfBand.BIOS.Status.PostCode)) }
+												if hw.OutOfBand.BIOS.Status.PostCodeStatus != "" {
+													({ hw.OutOfBand.BIOS.Status.PostCodeStatus })
+												}
+												</span>
+											}
+										</td>
+									</tr>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- BMC -->
+				if hw.OutOfBand.BMC.FirmwareVersion != "" || hw.OutOfBand.BMC.Status.Health != "" || (hw.OutOfBand.BMC.NIC != nil && hw.OutOfBand.BMC.NIC.MACAddresses() != "") {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">BMC</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+										<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+											if hw.OutOfBand.BMC.FirmwareVersion != "" {
+												<span class="text-gray-500 dark:text-gray-400">Firmware Version:</span> v{ hw.OutOfBand.BMC.FirmwareVersion }
+											}
+											if hw.OutOfBand.BMC.Status.Health != "" {
+												<span class="ml-2 text-gray-500 dark:text-gray-400 text-xs">Health:</span>
+												<span class="ml-1">@StatusBadge(hw.OutOfBand.BMC.Status.Health)</span>
+											}
+											if hw.OutOfBand.BMC.NIC != nil && hw.OutOfBand.BMC.NIC.MACAddresses() != "" {
+												<span class="ml-2 text-gray-500 dark:text-gray-400 text-xs">MAC Address:</span>
+												<span class="ml-1 font-mono text-gray-500 dark:text-gray-400">{ hw.OutOfBand.BMC.NIC.MACAddresses() }</span>
+											}
+										</td>
+									</tr>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- Baseboard -->
+				if hw.OutOfBand.Baseboard.Vendor != "" || hw.OutOfBand.Baseboard.SerialNumber != "" {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Baseboard</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+										<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+											if hw.OutOfBand.Baseboard.Vendor != "" {
+												{ hw.OutOfBand.Baseboard.Vendor }
+											}
+											if hw.OutOfBand.Baseboard.Model != "" {
+												<span> { hw.OutOfBand.Baseboard.Model }</span>
+											}
+											if hw.OutOfBand.Baseboard.SerialNumber != "" {
+												<span class="text-gray-500 dark:text-gray-400"> (S/N: { hw.OutOfBand.Baseboard.SerialNumber })</span>
+											}
+											if hw.OutOfBand.Baseboard.FirmwareVersion != "" {
+												<span class="text-gray-500 dark:text-gray-400"> (FW: { hw.OutOfBand.Baseboard.FirmwareVersion })</span>
+											}
+										</td>
+									</tr>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- Chassis -->
+				if hw.OutOfBand.Chassis.Vendor != "" || hw.OutOfBand.Chassis.SerialNumber != "" {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Chassis</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+										<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+											if hw.OutOfBand.Chassis.Vendor != "" {
+												{ hw.OutOfBand.Chassis.Vendor }
+											}
+											if hw.OutOfBand.Chassis.Model != "" {
+												<span> { hw.OutOfBand.Chassis.Model }</span>
+											}
+											if hw.OutOfBand.Chassis.SerialNumber != "" {
+												<span class="text-gray-500 dark:text-gray-400"> (S/N: { hw.OutOfBand.Chassis.SerialNumber })</span>
+											}
+										</td>
+									</tr>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- CPUs -->
+				if len(hw.OutOfBand.CPUs) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">CPUs</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<thead>
+									<tr class="border-b border-gray-200 dark:border-darkBorder">
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Slot</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Model</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Vendor</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Cores</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Threads</th>
+										<th class="py-2 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Clock Speed</th>
+									</tr>
+								</thead>
+								<tbody>
+									for _, cpu := range hw.OutOfBand.CPUs {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm font-mono text-gray-900 dark:text-white">
+												if cpu.Slot != "" {
+													{ cpu.Slot }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if cpu.Model != "" {
+													{ cpu.Model }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if cpu.Vendor != "" {
+													{ cpu.Vendor }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">{ strconv.Itoa(int(cpu.Cores)) }</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">{ strconv.Itoa(int(cpu.Threads)) }</td>
+											<td class="py-2 text-sm text-gray-900 dark:text-white">
+												if cpu.ClockSpeedMHz > 0 {
+													{ strconv.Itoa(int(cpu.ClockSpeedMHz)) } MHz
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- Memory -->
+				if len(hw.OutOfBand.MemoryModules) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Memory</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<thead>
+									<tr class="border-b border-gray-200 dark:border-darkBorder">
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Slot</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Vendor</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Size (GiB)</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Speed</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Form Factor</th>
+										<th class="py-2 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Part Number</th>
+									</tr>
+								</thead>
+								<tbody>
+									for _, mem := range hw.OutOfBand.MemoryModules {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm font-mono text-gray-900 dark:text-white">
+												if mem.Slot != "" {
+													{ mem.Slot }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if mem.Vendor != "" {
+													{ mem.Vendor }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if mem.SizeBytes > 0 {
+													{ strconv.FormatFloat(float64(mem.SizeBytes)/(1024*1024*1024), 'f', 0, 64) }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if mem.SpeedMHz > 0 {
+													{ strconv.Itoa(int(mem.SpeedMHz)) } MHz
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if mem.FormFactor != "" {
+													{ mem.FormFactor }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm font-mono text-gray-900 dark:text-white">
+												if mem.PartNumber != "" {
+													{ mem.PartNumber }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- Network Adapters -->
+				if len(hw.OutOfBand.NICs) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Network Adapters</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<thead>
+									<tr class="border-b border-gray-200 dark:border-darkBorder">
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Vendor</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Model</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Firmware</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">MAC Address</th>
+										<th class="py-2 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Speed</th>
+									</tr>
+								</thead>
+								<tbody>
+									for _, nic := range hw.OutOfBand.NICs {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if nic.Vendor != "" {
+													{ nic.Vendor }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if nic.Model != "" {
+													{ nic.Model }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if nic.FirmwareVersion != "" {
+													{ nic.FirmwareVersion }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm font-mono text-gray-900 dark:text-white">
+												if nic.MACAddresses() != "" {
+													{ nic.MACAddresses() }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm text-gray-900 dark:text-white">
+												if nic.PortSpeeds() != "" {
+													{ nic.PortSpeeds() }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- Collection Info -->
+				if hw.OutOfBand.CollectionMethod != "" || hw.OutOfBand.LastUpdated != "" {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Collection Info</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+										<td class="py-2 text-sm text-gray-900 dark:text-white">
+											if hw.OutOfBand.CollectionMethod != "" {
+												<span class="text-gray-500 dark:text-gray-400">Collection Method:</span> { hw.OutOfBand.CollectionMethod }
+											}
+											if hw.OutOfBand.LastUpdated != "" {
+												if hw.OutOfBand.CollectionMethod != "" {
+													<span class="text-gray-400 dark:text-gray-500 mx-2">•</span>
+												}
+												<span class="text-gray-500 dark:text-gray-400">Last Updated:</span> { hw.OutOfBand.LastUpdated }
+											}
+										</td>
+									</tr>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- Drives -->
+				if len(hw.OutOfBand.Drives) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Drives</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<thead>
+									<tr class="border-b border-gray-200 dark:border-darkBorder">
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Vendor</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Model</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Type</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Size (GB)</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">Serial</th>
+										<th class="py-2 pr-4 text-left text-sm font-medium text-gray-500 dark:text-gray-400">WWN</th>
+										<th class="py-2 text-left text-sm font-medium text-gray-500 dark:text-gray-400">SMART</th>
+									</tr>
+								</thead>
+								<tbody>
+									for _, drive := range hw.OutOfBand.Drives {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if drive.Vendor != "" {
+													{ drive.Vendor }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if drive.Model != "" {
+													{ drive.Model }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if drive.DriveType != "" {
+													{ drive.DriveType }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if drive.SizeBytes > 0 {
+													{ strconv.FormatFloat(float64(drive.SizeBytes)/1e9, 'f', 0, 64) }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm font-mono text-gray-900 dark:text-white">
+												if drive.SerialNumber != "" {
+													{ drive.SerialNumber }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm font-mono text-gray-900 dark:text-white">
+												if drive.WWN != "" {
+													{ drive.WWN }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm text-gray-900 dark:text-white">
+												if drive.SmartStatus != "" {
+													{ drive.SmartStatus }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- Storage Controllers -->
+				if len(hw.OutOfBand.StorageControllers) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Storage Controllers</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									for _, sc := range hw.OutOfBand.StorageControllers {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if sc.Vendor != "" {
+													{ sc.Vendor }
+												}
+												if sc.Model != "" {
+													<span> { sc.Model }</span>
+												}
+												if sc.Vendor == "" && sc.Model == "" {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if sc.FirmwareVersion != "" {
+													{ sc.FirmwareVersion }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm text-gray-900 dark:text-white">
+												if sc.Status.Health != "" {
+													@StatusBadge(sc.Status.Health)
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- Power Supplies -->
+				if len(hw.OutOfBand.PSUs) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Power Supplies</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									for _, psu := range hw.OutOfBand.PSUs {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if psu.Vendor != "" {
+													{ psu.Vendor }
+												}
+												if psu.Model != "" {
+													<span> { psu.Model }</span>
+												}
+												if psu.Vendor == "" && psu.Model == "" {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if psu.PowerCapacityWatts > 0 {
+													{ strconv.FormatInt(psu.PowerCapacityWatts, 10) } W
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm text-gray-900 dark:text-white">
+												if psu.Status.Health != "" {
+													@StatusBadge(psu.Status.Health)
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- GPUs -->
+				if len(hw.OutOfBand.GPUs) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">GPUs</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									for _, gpu := range hw.OutOfBand.GPUs {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 text-sm text-gray-900 dark:text-white">
+												if gpu.Vendor != "" {
+													{ gpu.Vendor }
+												}
+												if gpu.Model != "" {
+													<span> { gpu.Model }</span>
+												}
+												if gpu.Vendor == "" && gpu.Model == "" {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+
+				<!-- TPMs -->
+				if len(hw.OutOfBand.TPMs) > 0 {
+					<div>
+						<h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">TPMs</h4>
+						<div class="overflow-x-auto">
+							<table class="min-w-full">
+								<tbody>
+									for _, tpm := range hw.OutOfBand.TPMs {
+										<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+											<td class="py-2 pr-4 text-sm text-gray-900 dark:text-white">
+												if tpm.InterfaceType != "" {
+													{ tpm.InterfaceType }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+											<td class="py-2 text-sm font-mono text-gray-900 dark:text-white">
+												if tpm.SerialNumber != "" {
+													{ tpm.SerialNumber }
+												} else {
+													<span class="text-gray-400">-</span>
+												}
+											</td>
+										</tr>
+									}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				}
+			</div>
+		}
+	}
+
+	<!-- Status Section -->
+	@SectionBoxCollapsible("Status", false) {
+		@CodeBlockYAML(hw.StatusYAML)
+	}
+
+	<!-- Spec Section -->
+	@SectionBoxCollapsible("Spec", true) {
+		@CodeBlockYAML(hw.SpecYAML)
+	}
+
+	<!-- Full YAML -->
+	@SectionBoxCollapsible("Full YAML", false) {
+		@CodeBlockYAMLWithCopy(hw.YAML, "hw-yaml")
+	}
+}
+
+templ WorkflowDetailContent(wf WorkflowDetail, baseURL string) {
+	@MainInfoHeader(wf.Name, wf.State)
+	
+	<!-- Main Info Section -->
+	@SectionBox("Info") {
+		@MetadataTable(wf.Name, wf.Namespace, wf.CreatedAt, wf.Labels, wf.Annotations)
+	}
+	
+	<!-- Workflow Details -->
+	@SectionBox("Workflow Details") {
+		<div class="overflow-x-auto">
+			<table class="min-w-full">
+				<tbody>
+				if wf.TemplateRef != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Template</td>
+						<td class="py-3 text-sm"><a href={ templ.SafeURL(baseURL + "/templates/" + wf.Namespace + "/" + wf.TemplateRef) } class="text-tink-teal-600 hover:text-tink-teal-700 dark:text-tink-teal-400 dark:hover:text-tink-teal-300 hover:underline">{ wf.TemplateRef }</a></td>
+					</tr>
+				}
+				if wf.State != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">State</td>
+						<td class="py-3 text-sm text-gray-900 dark:text-white">{ wf.State }</td>
+					</tr>
+				}
+				<tr class="border-b border-gray-100 dark:border-darkBorder">
+					<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Disabled</td>
+					<td class="py-3 text-sm text-gray-900 dark:text-white">
+						@WorkflowDisabledControl(wf)
+					</td>
+				</tr>
+				if wf.Task != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Current Task</td>
+						<td class="py-3 text-sm text-gray-900 dark:text-white">{ wf.Task }</td>
+					</tr>
+				}
+				if wf.Action != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Current Action</td>
+						<td class="py-3 text-sm text-gray-900 dark:text-white">{ wf.Action }</td>
+					</tr>
+				}
+				if wf.Agent != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Agent</td>
+						<td class="py-3 text-sm text-gray-900 dark:text-white">{ wf.Agent }</td>
+					</tr>
+				}
+				if wf.HardwareRef != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Hardware</td>
+						<td class="py-3 text-sm"><a href={ templ.SafeURL(baseURL + "/hardware/" + wf.Namespace + "/" + wf.HardwareRef) } class="text-tink-teal-600 hover:text-tink-teal-700 dark:text-tink-teal-400 dark:hover:text-tink-teal-300 hover:underline">{ wf.HardwareRef }</a></td>
+					</tr>
+				}
+				if wf.TemplateRendering != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Template Rendering</td>
+						<td class="py-3 text-sm text-gray-900 dark:text-white">{ wf.TemplateRendering }</td>
+					</tr>
+					}
+				</tbody>
+			</table>
+		</div>
+	}
+	
+	<!-- Status Section -->
+	@SectionBoxCollapsible("Status", true) {
+		@CodeBlockYAML(wf.StatusYAML)
+	}
+	
+	<!-- Spec Section -->
+	@SectionBoxCollapsible("Spec", false) {
+		@CodeBlockYAML(wf.SpecYAML)
+	}
+	
+	<!-- Raw YAML -->
+	@SectionBoxCollapsible("Full YAML", false) {
+		@CodeBlockYAMLWithCopy(wf.YAML, "wf-yaml")
+	}
+}
+
+// WorkflowDisabledControl renders the current spec.disabled state of a Workflow.
+// Only an "Enable" action is offered, and the backend endpoint it posts to only
+// ever sets spec.disabled to false: a Workflow left enabled leaves State == ""
+// almost immediately on its own, so a "Disable" action would only ever win a
+// narrow race against the controller and isn't offered.
+//
+// If the user lacks update permission, the Enable button is rendered
+// non-actionable (aria-disabled + tooltip, not the native disabled attribute,
+// so it stays keyboard-focusable and screen readers announce why) instead of
+// letting the click fail with a 403.
+templ WorkflowDisabledControl(wf WorkflowDetail) {
+	<div id="workflow-disabled-control" class="flex items-center gap-3">
+		if wf.Disabled {
+			<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300">Yes</span>
+			if wf.CanUpdate {
+				<button
+					type="button"
+					hx-post={ "/workflows/" + wf.Namespace + "/" + wf.Name + "/enable" }
+					hx-target="#workflow-disabled-control"
+					hx-swap="outerHTML"
+					class="inline-flex items-center px-3 py-1 border border-gray-300 dark:border-darkBorder rounded-md text-xs font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-darkBg hover:bg-gray-50 dark:hover:bg-darkBorder transition-colors cursor-pointer"
+				>
+					Enable
+				</button>
+			} else {
+				<span
+					aria-disabled="true"
+					aria-label="Enable this Workflow — requires update permission on workflows.tinkerbell.org"
+					title="You need update permission on workflows.tinkerbell.org to enable this Workflow"
+					tabindex="0"
+					class="inline-flex items-center gap-1.5 px-3 py-1 border border-gray-200 dark:border-darkBorder rounded-md text-xs font-medium text-gray-400 dark:text-gray-500 bg-white dark:bg-darkBg cursor-not-allowed"
+				>
+					@templ.Raw(lockIcon())
+					Enable
+				</span>
+				<span
+					aria-hidden="true"
+					title="You need update permission on workflows.tinkerbell.org to enable this Workflow"
+					class="text-gray-400 dark:text-gray-500 cursor-help"
+				>
+					@templ.Raw(infoIcon())
+				</span>
+			}
+		} else {
+			<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">No</span>
+		}
+	</div>
+}
+
+templ TemplateDetailContent(tpl TemplateDetail, baseURL string) {
+	@MainInfoHeader(tpl.Name, tpl.State)
+	
+	<!-- Main Info Section -->
+	@SectionBox("Info") {
+		@MetadataTable(tpl.Name, tpl.Namespace, tpl.CreatedAt, tpl.Labels, tpl.Annotations)
+	}
+	
+	<!-- Template Data Section -->
+	if tpl.Data != "" {
+		@SectionBoxCollapsible("Template Data", true) {
+			@CodeBlockYAMLWithCopy(tpl.Data, "tpl-data")
+		}
+	}
+	
+	<!-- Spec Section -->
+	@SectionBoxCollapsible("Spec", false) {
+		@CodeBlockYAML(tpl.SpecYAML)
+	}
+	
+	<!-- Raw YAML -->
+	@SectionBoxCollapsible("Full YAML", false) {
+		@CodeBlockYAMLWithCopy(tpl.YAML, "tpl-yaml")
+	}
+}
+
+templ BMCMachineDetailContent(machine BMCMachineDetail, baseURL string) {
+	@MainInfoHeader(machine.Name, machine.PowerState)
+	
+	<!-- Main Info Section -->
+	@SectionBox("Info") {
+		@MetadataTable(machine.Name, machine.Namespace, machine.CreatedAt, machine.Labels, machine.Annotations)
+	}
+	
+	<!-- Machine Details -->
+	@SectionBox("Machine Details") {
+		@NameValueTable([]InfoRow{
+			{Name: "Power State", Value: machine.PowerState},
+			{Name: "Contactable", Value: machine.Contactable},
+			{Name: "Endpoint", Value: machine.Endpoint},
+		})
+	}
+	
+	<!-- Status Section -->
+	@SectionBoxCollapsible("Status", true) {
+		@CodeBlockYAML(machine.StatusYAML)
+	}
+	
+	<!-- Spec Section -->
+	@SectionBoxCollapsible("Spec", false) {
+		@CodeBlockYAML(machine.SpecYAML)
+	}
+	
+	<!-- Raw YAML -->
+	@SectionBoxCollapsible("Full YAML", false) {
+		@CodeBlockYAMLWithCopy(machine.YAML, "machine-yaml")
+	}
+}
+
+templ BMCJobDetailContent(job BMCJobDetail, baseURL string) {
+	@MainInfoHeader(job.Name, job.Status)
+	
+	<!-- Main Info Section -->
+	@SectionBox("Info") {
+		@MetadataTable(job.Name, job.Namespace, job.CreatedAt, job.Labels, job.Annotations)
+	}
+	
+	<!-- Job Details -->
+	@SectionBox("Job Details") {
+		@NameValueTable([]InfoRow{
+			{Name: "Machine Reference", Value: job.MachineRef, Link: baseURL + "/bmc/machines/" + job.MachineRef},
+			{Name: "Status", Value: job.Status},
+			{Name: "Completed At", Value: job.CompletedAt},
+		})
+	}
+	
+	<!-- Status Section -->
+	@SectionBoxCollapsible("Status", true) {
+		@CodeBlockYAML(job.StatusYAML)
+	}
+	
+	<!-- Spec Section -->
+	@SectionBoxCollapsible("Spec", false) {
+		@CodeBlockYAML(job.SpecYAML)
+	}
+	
+	<!-- Raw YAML -->
+	@SectionBoxCollapsible("Full YAML", false) {
+		@CodeBlockYAMLWithCopy(job.YAML, "job-yaml")
+	}
+}
+
+templ BMCTaskDetailContent(task BMCTaskDetail, baseURL string) {
+	@MainInfoHeader(task.Name, task.Status)
+	
+	<!-- Main Info Section -->
+	@SectionBox("Info") {
+		@MetadataTable(task.Name, task.Namespace, task.CreatedAt, task.Labels, task.Annotations)
+	}
+	
+	<!-- Task Details -->
+	@SectionBox("Task Details") {
+		@NameValueTable([]InfoRow{
+			{Name: "Job Reference", Value: task.JobRef, Link: func() string { if task.JobRef != "N/A" { return baseURL + "/bmc/jobs/" + task.JobRef }; return "" }()},
+			{Name: "Task Type", Value: task.TaskType},
+			{Name: "Status", Value: task.Status},
+			{Name: "Completed At", Value: task.CompletedAt},
+		})
+	}
+	
+	<!-- Status Section -->
+	@SectionBoxCollapsible("Status", true) {
+		@CodeBlockYAML(task.StatusYAML)
+	}
+	
+	<!-- Spec Section -->
+	@SectionBoxCollapsible("Spec", false) {
+		@CodeBlockYAML(task.SpecYAML)
+	}
+	
+	<!-- Raw YAML -->
+	@SectionBoxCollapsible("Full YAML", false) {
+		@CodeBlockYAMLWithCopy(task.YAML, "task-yaml")
+	}
+}
+
+templ WorkflowRuleSetDetailContent(rs WorkflowRuleSetDetail, baseURL string) {
+	@MainInfoHeader(rs.Name, "")
+	
+	<!-- Main Info Section -->
+	@SectionBox("Info") {
+		@MetadataTable(rs.Name, rs.Namespace, rs.CreatedAt, rs.Labels, rs.Annotations)
+	}
+	
+	<!-- Ruleset Details -->
+	@SectionBox("Ruleset Details") {
+		<div class="overflow-x-auto">
+			<table class="min-w-full">
+				<tbody>
+				if rs.TemplateRef != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Template</td>
+						<td class="py-3 text-sm"><a href={ templ.SafeURL(baseURL + "/templates/" + rs.WorkflowNamespace + "/" + rs.TemplateRef) } class="text-tink-teal-600 hover:text-tink-teal-700 dark:text-tink-teal-400 dark:hover:text-tink-teal-300 hover:underline">{ rs.TemplateRef }</a></td>
+					</tr>
+				}
+				if rs.WorkflowNamespace != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Workflow Namespace</td>
+						<td class="py-3 text-sm text-gray-900 dark:text-white">{ rs.WorkflowNamespace }</td>
+					</tr>
+				}
+				<tr class="border-b border-gray-100 dark:border-darkBorder">
+					<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Workflow Disabled</td>
+					<td class="py-3 text-sm text-gray-900 dark:text-white">
+						if rs.WorkflowDisabled {
+							<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300">Yes</span>
+						} else {
+							<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">No</span>
+						}
+					</td>
+				</tr>
+				<tr class="border-b border-gray-100 dark:border-darkBorder">
+					<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Add Attributes</td>
+					<td class="py-3 text-sm text-gray-900 dark:text-white">
+						if rs.AddAttributes {
+							<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">Yes</span>
+						} else {
+							<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300">No</span>
+						}
+					</td>
+				</tr>
+				if rs.AgentValue != "" {
+					<tr class="border-b border-gray-100 dark:border-darkBorder last:border-b-0">
+						<td class="py-3 pr-4 text-sm font-medium text-gray-500 dark:text-gray-400 w-1/4 align-top">Agent Value</td>
+						<td class="py-3 text-sm font-mono text-gray-900 dark:text-white">{ rs.AgentValue }</td>
+					</tr>
+				}
+				</tbody>
+			</table>
+		</div>
+	}
+	
+	<!-- Rules Section -->
+	if len(rs.Rules) > 0 {
+		@SectionBoxCollapsible("Matching Rules", true) {
+			<div class="space-y-2">
+				for i, rule := range rs.Rules {
+					<div class="p-3 bg-gray-50 dark:bg-darkBg rounded-md border border-gray-200 dark:border-darkBorder">
+						<div class="flex items-center justify-between mb-1">
+							<span class="text-xs font-medium text-gray-500 dark:text-gray-400">Rule { strconv.Itoa(i+1) }</span>
+						</div>
+						<pre class="text-sm font-mono text-gray-900 dark:text-white whitespace-pre-wrap break-all">{ rule }</pre>
+					</div>
+				}
+			</div>
+		}
+	}
+	
+	<!-- Raw YAML -->
+	@SectionBoxCollapsible("Full YAML", false) {
+		@CodeBlockYAMLWithCopy(rs.YAMLData, "ruleset-yaml")
+	}
+}

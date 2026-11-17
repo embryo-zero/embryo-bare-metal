@@ -1,0 +1,373 @@
+package script
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"path"
+
+	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/tinkerbell/tinkerbell/smee/internal/bootstrap"
+	"github.com/tinkerbell/tinkerbell/smee/internal/hardware"
+	"github.com/tinkerbell/tinkerbell/smee/internal/metric"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+type Handler struct {
+	Logger                logr.Logger
+	Backend               hardware.BackendReader
+	OSIEURL               string
+	OSIEURLv6             string
+	ExtraKernelParams     []string
+	ExtraKernelParamsV6   []string
+	PublicSyslogFQDN      string
+	PublicSyslogFQDNV6    string
+	TinkServerTLS         bool
+	TinkServerInsecureTLS bool
+	TinkServerGRPCAddr    string
+	TinkServerGRPCAddrV6  string
+	IPXEScriptRetries     int
+	IPXEScriptRetryDelay  int
+	StaticIPXEEnabled     bool
+	StaticIPXEV6Enabled   bool
+	KernelName            string // name of the kernel file
+	InitrdName            string // name of the initrd file
+	// BootstrapPath is the route per-host configuration archives are served
+	// under on this server, e.g. "/bootstrap/". Empty disables delivery.
+	BootstrapPath string
+}
+
+type addressFamily string
+
+const (
+	ipv4 addressFamily = "ipv4"
+	ipv6 addressFamily = "ipv6"
+)
+
+// familySettings is the address-family-specific view of the handler's settings.
+type familySettings struct {
+	addressFamily      addressFamily
+	staticIPXEEnabled  bool
+	downloadURL        string
+	tinkServerGRPCAddr string
+	extraKernelParams  []string
+}
+
+func (h *Handler) settingsFor(family addressFamily) familySettings {
+	if family == ipv6 {
+		return familySettings{
+			addressFamily:      ipv6,
+			staticIPXEEnabled:  h.StaticIPXEV6Enabled,
+			downloadURL:        h.OSIEURLv6,
+			tinkServerGRPCAddr: h.TinkServerGRPCAddrV6,
+			extraKernelParams:  h.ExtraKernelParamsV6,
+		}
+	}
+	return familySettings{
+		addressFamily:      ipv4,
+		staticIPXEEnabled:  h.StaticIPXEEnabled,
+		downloadURL:        h.OSIEURL,
+		tinkServerGRPCAddr: h.TinkServerGRPCAddr,
+		extraKernelParams:  h.ExtraKernelParams,
+	}
+}
+
+// HandlerFunc returns a http.HandlerFunc that serves the ipxe script.
+// It is expected that the request path is /<mac address>/auto.ipxe or /<mac address>/auto6.ipxe.
+func (h *Handler) HandlerFunc() http.HandlerFunc {
+	const metricLabelFrom = "from"
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		scriptPath := r.URL.Path
+		scriptName := path.Base(scriptPath)
+		var family addressFamily
+		switch scriptName {
+		case "auto.ipxe":
+			family = ipv4
+		case "auto6.ipxe":
+			family = ipv6
+		default:
+			h.Logger.Info("URL path not supported", "path", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+
+			return
+		}
+		settings := h.settingsFor(family)
+		labels := prometheus.Labels{metricLabelFrom: "http", "op": "file"}
+		metric.JobsTotal.With(labels).Inc()
+		metric.JobsInProgress.With(labels).Inc()
+		defer metric.JobsInProgress.With(labels).Dec()
+		timer := prometheus.NewTimer(metric.JobDuration.With(labels))
+		defer timer.ObserveDuration()
+
+		ctx := r.Context()
+
+		// Should we serve a custom ipxe script?
+		// This gates serving PXE file by
+		// 1. the existence of a hardware record in tink server
+		// AND
+		// 2. the network.interfaces[].netboot.allow_pxe value, in the tink server hardware record, equal to true
+		// This allows serving custom ipxe scripts, starting up into OSIE or other installation environments
+		// without a tink workflow present.
+
+		// Try to get the MAC address from the URL path, if not available get the source IP address.
+		if ha, err := getMAC(scriptPath); err == nil {
+			hw, err := hardware.GetByMac(ctx, ha, h.Backend)
+			if err != nil && settings.staticIPXEEnabled {
+				h.Logger.Info("serving static ipxe script", "mac", ha.String(), "reasonForStaticScript", err)
+				h.serveStaticIPXEScript(w, settings)
+				return
+			}
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				h.Logger.Info("no hardware data for this machine, it is not allowed to pxe", "client", ha, "error", err)
+
+				return
+			}
+			if !hw.AllowNetboot {
+				h.serveNetbootNotAllowed(w, fmt.Sprintf("mac: %v", ha))
+
+				return
+			}
+			h.serveBootScript(ctx, w, scriptName, hw, settings)
+			return
+		}
+		if ip, err := getIP(r.RemoteAddr); err == nil {
+			hw, err := hardware.GetByIP(ctx, ip, h.Backend)
+			if err != nil && settings.staticIPXEEnabled {
+				h.Logger.Info("serving static ipxe script", "client", r.RemoteAddr, "error", err)
+				h.serveStaticIPXEScript(w, settings)
+				return
+			}
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				h.Logger.Info("no hardware data for this machine, it is not allowed to pxe", "client", r.RemoteAddr, "error", err)
+
+				return
+			}
+			if !hw.AllowNetboot {
+				h.serveNetbootNotAllowed(w, fmt.Sprintf("ip: %v", ip))
+
+				return
+			}
+			h.serveBootScript(ctx, w, scriptName, hw, settings)
+			return
+		}
+
+		// If we get here, we were unable to get the MAC address from the URL path or the source IP address.
+		w.WriteHeader(http.StatusNotFound)
+		h.Logger.Info("unable to get the MAC address from the URL path or the source IP address", "client", r.RemoteAddr, "urlPath", r.URL.Path)
+	}
+}
+
+// serveNetbootNotAllowed answers a client whose Hardware exists but has
+// netboot.allowPXE=false.
+//
+// It is a 403, not the 404 that a missing Hardware record gets, because the
+// two are different problems and only one of them is about the requested URL.
+// In the L3 scenarios (external DHCP, static IPs, DHCP relay) Smee's DHCP
+// handler never runs, so the "/netboot-not-allowed" boot file name it would
+// otherwise hand out is never seen and this response is the only signal the
+// operator gets. A 404 there is indistinguishable from a bad URL or a Smee
+// that has not loaded the Hardware, and sends people looking in the wrong
+// place; the status and the body both name allowPXE instead.
+//
+// The body is written as an iPXE comment so a client that fetched this as a
+// script and ignored the status still shows something intelligible rather
+// than a parse error.
+func (h *Handler) serveNetbootNotAllowed(w http.ResponseWriter, client string) {
+	h.Logger.Info("netboot not allowed for this hardware, netboot.allowPXE is false", "client", client)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusForbidden)
+	if _, err := fmt.Fprintf(w, "#!ipxe\n# netboot is not allowed for this hardware: netboot.allowPXE is false in the Hardware record (%s)\n", client); err != nil { //nolint:gosec // G705: client is a parsed MAC/IP, and the body is text/plain with nosniff
+		h.Logger.Error(err, "unable to send the netboot-not-allowed response", "client", client)
+	}
+}
+
+func (h *Handler) serveStaticIPXEScript(w http.ResponseWriter, settings familySettings) {
+	// Serve static iPXE script.
+	auto := Hook{
+		AddressFamily:     settings.addressFamily,
+		DownloadURL:       settings.downloadURL,
+		ExtraKernelParams: settings.extraKernelParams,
+		SyslogHost:        h.PublicSyslogFQDN,
+		SyslogHostV6:      h.PublicSyslogFQDNV6,
+		TinkerbellTLS:     h.TinkServerTLS,
+		TinkGRPCAuthority: settings.tinkServerGRPCAddr,
+		Retries:           h.IPXEScriptRetries,
+		RetryDelay:        h.IPXEScriptRetryDelay,
+		KernelName:        h.KernelName,
+		InitrdName:        h.InitrdName,
+	}
+	script, err := GenerateTemplate(auto, StaticScript)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		h.Logger.Error(err, "error generating the static ipxe script")
+		return
+	}
+	if _, err := w.Write([]byte(script)); err != nil {
+		h.Logger.Error(err, "unable to send the static ipxe script")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+}
+
+func getIP(remoteAddr string) (net.IP, error) {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return net.IP{}, fmt.Errorf("error parsing client address: %w: client: %v", err, remoteAddr)
+	}
+	ip := net.ParseIP(host)
+
+	return ip, nil
+}
+
+func getMAC(urlPath string) (net.HardwareAddr, error) {
+	mac := path.Base(path.Dir(urlPath))
+	ha, err := net.ParseMAC(mac)
+	if err != nil {
+		return net.HardwareAddr{}, fmt.Errorf("URL path not supported, the second to last element in the URL path must be a valid mac address, err: %w", err)
+	}
+
+	return ha, nil
+}
+
+// bootstrapURL returns the per-host configuration archive URL, or "" when
+// delivery is disabled.
+//
+// It is root-relative: iPXE resolves it against the script's own URL, so it
+// reaches this server however the client reached the script.
+func bootstrapURL(route string, mac net.HardwareAddr) string {
+	if route == "" {
+		return ""
+	}
+
+	return path.Join("/", route, mac.String(), bootstrap.ArchiveName)
+}
+
+func (h *Handler) serveBootScript(ctx context.Context, w http.ResponseWriter, name string, hw hardware.Info, settings familySettings) {
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attribute.String("smee.script_name", name))
+	var script []byte
+	// check if the custom script should be used
+	if hw.IPXEScriptURL != nil || hw.IPXEScript != "" {
+		name = "custom.ipxe"
+	}
+	switch name {
+	case "auto.ipxe", "auto6.ipxe":
+		s, err := h.defaultScript(span, hw, settings)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			h.Logger.Error(err, "error with default ipxe script", "script", name)
+			span.SetStatus(codes.Error, err.Error())
+
+			return
+		}
+		script = []byte(s)
+	case "custom.ipxe":
+		cs, err := h.customScript(hw)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			h.Logger.Error(err, "error with custom ipxe script", "script", name)
+			span.SetStatus(codes.Error, err.Error())
+
+			return
+		}
+		script = []byte(cs)
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		err := fmt.Errorf("boot script %q not found", name)
+		h.Logger.Error(err, "boot script not found", "script", name)
+		span.SetStatus(codes.Error, err.Error())
+
+		return
+	}
+	span.SetAttributes(attribute.String("ipxe-script", string(script)))
+
+	if _, err := w.Write(script); err != nil { //nolint:gosec // G705: script content is server-generated iPXE boot scripts, not user-supplied
+		h.Logger.Error(err, "unable to write boot script", "script", name)
+		span.SetStatus(codes.Error, err.Error())
+
+		return
+	}
+}
+
+func (h *Handler) defaultScript(span trace.Span, hw hardware.Info, settings familySettings) (string, error) {
+	mac := hw.MACAddress
+	arch := hw.Arch
+	if arch == "" {
+		arch = "x86_64"
+	}
+	// The worker ID will default to the mac address or use the one specified in the hardware object
+	wID := mac.String()
+	if hw.AgentID != "" {
+		wID = hw.AgentID
+	}
+
+	// Global params first, then per-Hardware OSIE.KernelParams so machine-specific
+	// values win on duplicate keys (Linux kernel cmdline is last-wins).
+	extraKernelParams := append(append([]string{}, settings.extraKernelParams...), hw.OSIE.KernelParams...)
+
+	auto := Hook{
+		AddressFamily:         settings.addressFamily,
+		Arch:                  arch,
+		Console:               "",
+		DownloadURL:           settings.downloadURL,
+		ExtraKernelParams:     extraKernelParams,
+		Facility:              hw.Facility,
+		HWAddr:                mac.String(),
+		SyslogHost:            h.PublicSyslogFQDN,
+		SyslogHostV6:          h.PublicSyslogFQDNV6,
+		TinkerbellTLS:         h.TinkServerTLS,
+		TinkerbellInsecureTLS: h.TinkServerInsecureTLS,
+		TinkGRPCAuthority:     settings.tinkServerGRPCAddr,
+		VLANID:                hw.VLANID,
+		WorkerID:              wID,
+		Retries:               h.IPXEScriptRetries,
+		RetryDelay:            h.IPXEScriptRetryDelay,
+	}
+	if h.KernelName != "" {
+		auto.KernelName = h.KernelName + "-" + arch
+	}
+	if h.InitrdName != "" {
+		auto.InitrdName = h.InitrdName + "-" + arch
+	}
+	if hw.OSIE.BaseURL != nil && hw.OSIE.BaseURL.String() != "" {
+		auto.DownloadURL = hw.OSIE.BaseURL.String()
+	}
+	if hw.OSIE.Kernel != "" {
+		auto.KernelName = hw.OSIE.Kernel
+	}
+	if hw.OSIE.Initrd != "" {
+		auto.InitrdName = hw.OSIE.Initrd
+	}
+	auto.BootstrapURL = bootstrapURL(h.BootstrapPath, mac)
+	if span.SpanContext().IsSampled() {
+		auto.TraceID = span.SpanContext().TraceID().String()
+	}
+
+	return GenerateTemplate(auto, HookScript)
+}
+
+// customScript returns the custom script or chain URL if defined in the hardware data otherwise an error.
+func (h *Handler) customScript(hw hardware.Info) (string, error) {
+	if hw.IPXEScriptURL != nil && hw.IPXEScriptURL.String() != "" {
+		if hw.IPXEScriptURL.Scheme != "http" && hw.IPXEScriptURL.Scheme != "https" {
+			return "", fmt.Errorf("invalid URL scheme: %v", hw.IPXEScriptURL.Scheme)
+		}
+		c := Custom{Chain: hw.IPXEScriptURL}
+		return GenerateTemplate(c, CustomScript)
+	}
+	if hw.IPXEScript != "" {
+		c := Custom{Script: hw.IPXEScript}
+		return GenerateTemplate(c, CustomScript)
+	}
+
+	return "", errors.New("no custom script or chain defined in the hardware data")
+}

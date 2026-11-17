@@ -1,0 +1,338 @@
+package grpc
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/tinkerbell/tinkerbell/pkg/proto"
+	"github.com/tinkerbell/tinkerbell/tink/agent/internal/spec"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+type mockWorkflowServiceClient struct {
+	GetActionFunc          func(ctx context.Context, req *proto.ActionRequest) (*proto.ActionResponse, error)
+	ReportActionStatusFunc func(ctx context.Context, req *proto.ActionStatusRequest) (*proto.ActionStatusResponse, error)
+}
+
+func (m *mockWorkflowServiceClient) GetAction(ctx context.Context, req *proto.ActionRequest, _ ...grpc.CallOption) (*proto.ActionResponse, error) {
+	return m.GetActionFunc(ctx, req)
+}
+
+func (m *mockWorkflowServiceClient) ReportActionStatus(ctx context.Context, req *proto.ActionStatusRequest, _ ...grpc.CallOption) (*proto.ActionStatusResponse, error) {
+	return m.ReportActionStatusFunc(ctx, req)
+}
+
+var errTest = errors.New("failed to get action")
+
+func TestRead(t *testing.T) {
+	tests := map[string]struct {
+		expectedSpec  spec.Action
+		protoResponse *proto.ActionResponse
+		expectedError error
+		readError     error
+	}{
+		"Success": {
+			expectedSpec: spec.Action{
+				AgentID:    "123",
+				TaskID:     "456",
+				WorkflowID: "789",
+				ID:         "0123",
+				Name:       "first action",
+				Image:      "alpine",
+				Args:       []string{"sleep", "5"},
+				Env: []spec.Env{
+					{
+						Key:   "ENV_VAR",
+						Value: "value",
+					},
+					{
+						Key:   "UNSET_VAR",
+						Value: "",
+					},
+				},
+				Volumes:        []spec.Volume{"/var/lib:/var/lib"},
+				Namespaces:     spec.Namespaces{},
+				Retries:        0,
+				TimeoutSeconds: 60,
+			},
+			protoResponse: &proto.ActionResponse{
+				WorkflowId: toPtr("789"),
+				TaskId:     toPtr("456"),
+				AgentId:    toPtr("123"),
+				ActionId:   toPtr("0123"),
+				Name:       toPtr("first action"),
+				Image:      toPtr("alpine"),
+				Timeout:    toPtr(int64(60)),
+				Command:    []string{"sleep", "5"},
+				Volumes:    []string{"/var/lib:/var/lib"},
+				Environment: []string{
+					"ENV_VAR=value",
+					"UNSET_VAR",
+				},
+			},
+		},
+		"Success with host network": {
+			expectedSpec: spec.Action{
+				AgentID:    "123",
+				TaskID:     "456",
+				WorkflowID: "789",
+				ID:         "0123",
+				Name:       "inventory action",
+				Image:      "example/inventory:latest",
+				Env:        []spec.Env{},
+				Volumes:    []spec.Volume{"/dev:/dev"},
+				Namespaces: spec.Namespaces{
+					Network: "host",
+				},
+				Retries:        0,
+				TimeoutSeconds: 120,
+			},
+			protoResponse: &proto.ActionResponse{
+				WorkflowId: toPtr("789"),
+				TaskId:     toPtr("456"),
+				AgentId:    toPtr("123"),
+				ActionId:   toPtr("0123"),
+				Name:       toPtr("inventory action"),
+				Image:      toPtr("example/inventory:latest"),
+				Timeout:    toPtr(int64(120)),
+				Volumes:    []string{"/dev:/dev"},
+				Namespaces: &proto.Namespaces{Network: toPtr("host")},
+			},
+		},
+		"Success with host network and pid": {
+			expectedSpec: spec.Action{
+				AgentID:    "123",
+				TaskID:     "456",
+				WorkflowID: "789",
+				ID:         "0123",
+				Name:       "inventory action",
+				Image:      "example/inventory:latest",
+				Env:        []spec.Env{},
+				Volumes:    []spec.Volume{},
+				Namespaces: spec.Namespaces{
+					Network: "host",
+					PID:     "host",
+				},
+				Retries:        0,
+				TimeoutSeconds: 120,
+			},
+			protoResponse: &proto.ActionResponse{
+				WorkflowId: toPtr("789"),
+				TaskId:     toPtr("456"),
+				AgentId:    toPtr("123"),
+				ActionId:   toPtr("0123"),
+				Name:       toPtr("inventory action"),
+				Image:      toPtr("example/inventory:latest"),
+				Timeout:    toPtr(int64(120)),
+				Namespaces: &proto.Namespaces{Network: toPtr("host"), Pid: toPtr("host")},
+			},
+		},
+		"Error": {
+			expectedSpec:  spec.Action{},
+			protoResponse: nil,
+			readError:     errTest,
+			expectedError: errTest,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			mockClient := &mockWorkflowServiceClient{
+				GetActionFunc: func(_ context.Context, _ *proto.ActionRequest) (*proto.ActionResponse, error) {
+					return test.protoResponse, test.readError
+				},
+			}
+
+			config := &Config{
+				TinkServerClient: mockClient,
+				AgentID:          "worker-123",
+			}
+
+			ctx := context.Background()
+			got, err := config.Read(ctx)
+			if test.expectedError != nil {
+				if !errors.Is(err, test.expectedError) {
+					t.Fatalf("expected error: %v, got: %v", test.expectedError, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("expected no error, got: %v", err)
+				}
+				if diff := cmp.Diff(got, test.expectedSpec); diff != "" {
+					t.Errorf("unexpected difference:\n%v", diff)
+				}
+			}
+		})
+	}
+}
+
+func TestWrite(t *testing.T) {
+	tests := map[string]struct {
+		expectedError     error
+		expectedPermanent bool
+	}{
+		"Success": {
+			expectedError: nil,
+		},
+		"Error": {
+			expectedError: errors.New("failed to report action"),
+		},
+		"FailedPrecondition is permanent": {
+			expectedError:     status.Error(codes.FailedPrecondition, "workflow is failed"),
+			expectedPermanent: true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			mockClient := &mockWorkflowServiceClient{
+				ReportActionStatusFunc: func(_ context.Context, _ *proto.ActionStatusRequest) (*proto.ActionStatusResponse, error) {
+					return nil, test.expectedError
+				},
+			}
+
+			config := &Config{
+				TinkServerClient: mockClient,
+				AgentID:          "worker-123",
+			}
+
+			ctx := context.Background()
+			err := config.Write(ctx, spec.Event{State: spec.StateRunning})
+			if test.expectedError != nil {
+				if !errors.Is(err, test.expectedError) {
+					t.Fatalf("expected error: %v, got: %v", test.expectedError, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("expected no error, got: %v", err)
+				}
+			}
+			var permanent interface{ Permanent() bool }
+			if got := errors.As(err, &permanent) && permanent.Permanent(); got != test.expectedPermanent {
+				t.Fatalf("permanent error = %v, want %v", got, test.expectedPermanent)
+			}
+		})
+	}
+}
+
+func TestNewClientConn(t *testing.T) {
+	tests := map[string]struct {
+		address string
+		wantErr bool
+	}{
+		"no error": {
+			address: "localhost:8080",
+			wantErr: false,
+		},
+		"error": {
+			address: "",
+			wantErr: true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			conn, err := NewClientConn(test.address, false, false)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("expected no error, got: %v", err)
+				}
+				if conn == nil {
+					t.Fatalf("expected non-nil connection")
+				}
+			}
+		})
+	}
+}
+
+func TestErrorClassification(t *testing.T) {
+	type class struct{ noAction, conflict, permanent bool }
+	classify := func(err error) class {
+		var c interface {
+			NoAction() bool
+			Conflict() bool
+			Permanent() bool
+		}
+		if !errors.As(err, &c) {
+			return class{}
+		}
+		return class{c.NoAction(), c.Conflict(), c.Permanent()}
+	}
+	tests := map[string]struct {
+		code      codes.Code
+		wantRead  class
+		wantWrite class
+	}{
+		"NotFound":           {code: codes.NotFound, wantRead: class{noAction: true}, wantWrite: class{permanent: true}},
+		"FailedPrecondition": {code: codes.FailedPrecondition, wantRead: class{noAction: true}, wantWrite: class{permanent: true}},
+		"InvalidArgument":    {code: codes.InvalidArgument, wantWrite: class{permanent: true}},
+		"Aborted":            {code: codes.Aborted, wantRead: class{conflict: true}, wantWrite: class{conflict: true}},
+		"Unavailable":        {code: codes.Unavailable},
+		"Internal":           {code: codes.Internal},
+		"DeadlineExceeded":   {code: codes.DeadlineExceeded},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			serverErr := status.Error(tt.code, "server error")
+			c := &Config{
+				AgentID: "worker-123",
+				TinkServerClient: &mockWorkflowServiceClient{
+					GetActionFunc: func(context.Context, *proto.ActionRequest) (*proto.ActionResponse, error) {
+						return nil, serverErr
+					},
+					ReportActionStatusFunc: func(context.Context, *proto.ActionStatusRequest) (*proto.ActionStatusResponse, error) {
+						return nil, serverErr
+					},
+				},
+			}
+			_, readErr := c.Read(context.Background())
+			if got := classify(readErr); got != tt.wantRead {
+				t.Errorf("Read classification = %+v, want %+v", got, tt.wantRead)
+			}
+			if status.Code(readErr) != tt.code {
+				t.Errorf("Read lost the status code: got %s, want %s", status.Code(readErr), tt.code)
+			}
+			writeErr := c.Write(context.Background(), spec.Event{})
+			if got := classify(writeErr); got != tt.wantWrite {
+				t.Errorf("Write classification = %+v, want %+v", got, tt.wantWrite)
+			}
+			if status.Code(writeErr) != tt.code {
+				t.Errorf("Write lost the status code: got %s, want %s", status.Code(writeErr), tt.code)
+			}
+		})
+	}
+}
+
+func TestRequestDeadline(t *testing.T) {
+	c := &Config{
+		AgentID: "worker-123",
+		TinkServerClient: &mockWorkflowServiceClient{
+			GetActionFunc: func(ctx context.Context, _ *proto.ActionRequest) (*proto.ActionResponse, error) {
+				if _, ok := ctx.Deadline(); !ok {
+					t.Error("GetAction called without a deadline")
+				}
+				return &proto.ActionResponse{}, nil
+			},
+			ReportActionStatusFunc: func(ctx context.Context, _ *proto.ActionStatusRequest) (*proto.ActionStatusResponse, error) {
+				if _, ok := ctx.Deadline(); !ok {
+					t.Error("ReportActionStatus called without a deadline")
+				}
+				return &proto.ActionStatusResponse{}, nil
+			},
+		},
+	}
+	if _, err := c.Read(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Write(context.Background(), spec.Event{}); err != nil {
+		t.Fatal(err)
+	}
+}

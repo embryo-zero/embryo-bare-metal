@@ -1,0 +1,192 @@
+package workflow
+
+import (
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	v1alpha1 "github.com/tinkerbell/tinkerbell/api/v1alpha1/tinkerbell"
+)
+
+func TestYAMLToStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		inputWf *Workflow
+		want    *v1alpha1.WorkflowStatus
+	}{
+		{
+			"Nil workflow",
+			nil,
+			nil,
+		},
+		{
+			"Full crd",
+			&Workflow{
+				Version:       "1",
+				Name:          "debian-provision",
+				ID:            "0a90fac9-b509-4aa5-b294-5944128ece81",
+				GlobalTimeout: 600,
+				Tasks: []Task{
+					{
+						Name:       "do-or-do-not-there-is-no-try",
+						WorkerAddr: "00:00:53:00:53:F4",
+						Actions: []Action{
+							{
+								Name:    "stream-image-to-disk",
+								Image:   "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+								Timeout: 300,
+								Volumes: []string{
+									"/dev:/dev",
+									"/dev/console:/dev/console",
+									"/lib/firmware:/lib/firmware:ro",
+									"/tmp/debug:/tmp/debug",
+								},
+								Environment: map[string]string{
+									"COMPRESSED": valueTrue,
+									"DEST_DISK":  "/dev/nvme0n1",
+									"IMG_URL":    "http://10.1.1.11:8080/debian-10-openstack-amd64.raw.gz",
+								},
+								Pid: "host",
+							},
+						},
+					},
+				},
+			},
+			&v1alpha1.WorkflowStatus{
+				GlobalTimeout: 600,
+				AgentID:       "00:00:53:00:53:F4",
+				Tasks: []v1alpha1.Task{
+					{
+						Name:    "do-or-do-not-there-is-no-try",
+						AgentID: "00:00:53:00:53:F4",
+						Actions: []v1alpha1.Action{
+							{
+								Name:    "stream-image-to-disk",
+								Image:   "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+								Timeout: 300,
+								Volumes: []string{
+									"/dev:/dev",
+									"/dev/console:/dev/console",
+									"/lib/firmware:/lib/firmware:ro",
+									"/tmp/debug:/tmp/debug",
+								},
+								Pid: "host",
+								Environment: map[string]string{
+									"COMPRESSED": valueTrue,
+									"DEST_DISK":  "/dev/nvme0n1",
+									"IMG_URL":    "http://10.1.1.11:8080/debian-10-openstack-amd64.raw.gz",
+								},
+								State: v1alpha1.WorkflowStatePending,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			"Action with namespaces",
+			&Workflow{
+				Version:       "1",
+				Name:          "inventory-workflow",
+				ID:            "abc-123",
+				GlobalTimeout: 300,
+				Tasks: []Task{
+					{
+						Name:       "inventory-task",
+						WorkerAddr: "00:00:53:00:53:F4",
+						Actions: []Action{
+							{
+								Name:    "run-inventory",
+								Image:   "example/inventory:latest",
+								Timeout: 120,
+								Namespaces: ActionNamespaces{
+									Network: "host",
+									PID:     "host",
+								},
+							},
+						},
+					},
+				},
+			},
+			&v1alpha1.WorkflowStatus{
+				GlobalTimeout: 300,
+				AgentID:       "00:00:53:00:53:F4",
+				Tasks: []v1alpha1.Task{
+					{
+						Name:    "inventory-task",
+						AgentID: "00:00:53:00:53:F4",
+						Actions: []v1alpha1.Action{
+							{
+								Name:    "run-inventory",
+								Image:   "example/inventory:latest",
+								Timeout: 120,
+								Namespaces: &v1alpha1.ActionNamespaces{
+									Network: "host",
+									PID:     "host",
+								},
+								State: v1alpha1.WorkflowStatePending,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			"Action with namespaces and legacy pid",
+			&Workflow{
+				Version:       "1",
+				Name:          "mixed-workflow",
+				ID:            "def-456",
+				GlobalTimeout: 300,
+				Tasks: []Task{
+					{
+						Name:       "mixed-task",
+						WorkerAddr: "00:00:53:00:53:F4",
+						Actions: []Action{
+							{
+								Name:    "run-action",
+								Image:   "example/action:latest",
+								Timeout: 120,
+								Pid:     "host",
+								Namespaces: ActionNamespaces{
+									Network: "host",
+								},
+							},
+						},
+					},
+				},
+			},
+			&v1alpha1.WorkflowStatus{
+				GlobalTimeout: 300,
+				AgentID:       "00:00:53:00:53:F4",
+				Tasks: []v1alpha1.Task{
+					{
+						Name:    "mixed-task",
+						AgentID: "00:00:53:00:53:F4",
+						Actions: []v1alpha1.Action{
+							{
+								Name:    "run-action",
+								Image:   "example/action:latest",
+								Timeout: 120,
+								Pid:     "host",
+								Namespaces: &v1alpha1.ActionNamespaces{
+									Network: "host",
+								},
+								State: v1alpha1.WorkflowStatePending,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := YAMLToStatus(tc.inputWf)
+			if diff := cmp.Diff(got, tc.want, cmpopts.IgnoreFields(v1alpha1.Task{}, "ID"), cmpopts.IgnoreFields(v1alpha1.Action{}, "ID")); diff != "" {
+				t.Errorf("unexpected difference:\n%v", diff)
+			}
+		})
+	}
+}

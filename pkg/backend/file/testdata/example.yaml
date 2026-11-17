@@ -1,0 +1,116 @@
+- apiVersion: tinkerbell.org/v1alpha1
+  kind: Hardware
+  metadata:
+    name: pxe-virtualbox
+    namespace: default
+  spec:
+    interfaces:
+    - dhcp:
+        mac: "08:00:27:29:4e:67"
+        hostname: "pxe-virtualbox"
+        domain_name: "example.com"
+        name_servers:
+        - "8.8.8.8"
+        - "1.1.1.1"
+        time_servers:
+        - "132.163.96.2"
+        - "132.163.96.3"
+        lease_time: 86400
+        ip:
+          address: "192.168.2.153"
+          netmask: "255.255.255.0"
+          gateway: "192.168.2.1"
+      netboot:
+        allowPXE: true
+        ipxe:
+          url: "https://boot.netboot.xyz"
+- apiVersion: tinkerbell.org/v1alpha1
+  kind: Hardware
+  metadata:
+    name: sandbox
+    namespace: default
+  spec:
+    interfaces:
+    - dhcp:
+        mac: "52:54:00:aa:88:2a"
+        hostname: "sandbox"
+        domain_name: "example.com"
+        name_servers:
+        - "8.8.8.8"
+        - "1.1.1.1"
+        time_servers:
+        - "132.163.96.2"
+        - "132.163.96.3"
+        lease_time: 86400
+        ip:
+          address: "192.168.2.15"
+          netmask: "255.255.255.0"
+          gateway: "192.168.2.1"
+      netboot:
+        allowPXE: true
+        ipxe:
+          url: "https://boot.netboot.xyz"
+- apiVersion: tinkerbell.org/v1alpha1
+  kind: Hardware
+  metadata:
+    name: pxe-proxmox
+    namespace: default
+  spec:
+    interfaces:
+    - dhcp:
+        mac: "86:96:b0:6e:ca:36"
+        hostname: "pxe-proxmox"
+        domain_name: "example.com"
+        name_servers:
+        - "8.8.8.8"
+        - "1.1.1.1"
+        time_servers:
+        - "132.163.96.2"
+        - "132.163.96.3"
+        lease_time: 86400
+        ip:
+          address: "192.168.2.158"
+          netmask: "255.255.255.0"
+          gateway: "192.168.2.1"
+      netboot:
+        allowPXE: true
+        ipxe:
+          url: "http://boot.netboot.xyz"
+- apiVersion: tinkerbell.org/v1alpha1
+  kind: Hardware
+  metadata:
+    name: dhcp-testing
+    namespace: default
+  spec:
+    interfaces:
+    - dhcp:
+        mac: "b4:96:91:6f:33:d0"
+        hostname: "dhcp-testing"
+        domain_name: "example.com"
+        name_servers:
+        - "8.8.8.8"
+        - "1.1.1.1"
+        time_servers:
+        - "132.163.96.2"
+        - "132.163.96.3"
+        lease_time: 86400
+        ip:
+          address: "192.168.56.15"
+          netmask: "255.255.255.0"
+          gateway: "192.168.56.4"
+      netboot:
+        allowPXE: true
+        ipxe:
+          url: "https://boot.netboot.xyz"
+- apiVersion: tinkerbell.org/v1alpha1
+  kind: Hardware
+  metadata:
+    name: bad-data
+    namespace: default
+  spec:
+    interfaces:
+    - dhcp:
+        mac: "08:00:27:29:4e:68"
+        ip:
+          address: "3"
+          netmask: "255.255.255.0"

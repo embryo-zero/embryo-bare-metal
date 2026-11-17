@@ -1,0 +1,125 @@
+package data
+
+// AgentAttributes are attributes of an Agent.
+type AgentAttributes struct {
+	CPU               *CPU       `json:"cpu,omitempty" yaml:"cpu,omitempty"`
+	Memory            *Memory    `json:"memory,omitempty" yaml:"memory,omitempty"`
+	BlockDevices      []*Block   `json:"blockDevices,omitempty" yaml:"blockDevices,omitempty"`
+	NetworkInterfaces []*Network `json:"networkInterfaces,omitempty" yaml:"networkInterfaces,omitempty"`
+	PCIDevices        []*PCI     `json:"pciDevices,omitempty" yaml:"pciDevices,omitempty"`
+	GPUDevices        []*GPU     `json:"gpuDevices,omitempty" yaml:"gpuDevices,omitempty"`
+	Chassis           *Chassis   `json:"chassis,omitempty" yaml:"chassis,omitempty"`
+	BIOS              *BIOS      `json:"bios,omitempty" yaml:"bios,omitempty"`
+	Baseboard         *Baseboard `json:"baseboard,omitempty" yaml:"baseboard,omitempty"`
+	Product           *Product   `json:"product,omitempty" yaml:"product,omitempty"`
+}
+
+type CPU struct {
+	TotalCores   *uint32      `json:"totalCores,omitempty" yaml:"totalCores,omitempty"`
+	TotalThreads *uint32      `json:"totalThreads,omitempty" yaml:"totalThreads,omitempty"`
+	Processors   []*Processor `json:"processors,omitempty" yaml:"processors,omitempty"`
+}
+
+type Processor struct {
+	ID           *uint32  `json:"id,omitempty" yaml:"id,omitempty"`
+	Cores        *uint32  `json:"cores,omitempty" yaml:"cores,omitempty"`
+	Threads      *uint32  `json:"threads,omitempty" yaml:"threads,omitempty"`
+	Vendor       *string  `json:"vendor,omitempty" yaml:"vendor,omitempty"`
+	Model        *string  `json:"model,omitempty" yaml:"model,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty" yaml:"capabilities,omitempty"`
+}
+
+// Memory carries exact byte counts, not pre-formatted strings, so consumers
+// (the Hardware annotation/status writers, the UI) can format them however
+// they need rather than being stuck with whatever units the Agent chose.
+type Memory struct {
+	TotalBytes  *int64 `json:"totalBytes,omitempty" yaml:"totalBytes,omitempty"`
+	UsableBytes *int64 `json:"usableBytes,omitempty" yaml:"usableBytes,omitempty"`
+}
+
+type Block struct {
+	Name                   *string `json:"name,omitempty" yaml:"name,omitempty"`
+	ControllerType         *string `json:"controllerType,omitempty" yaml:"controllerType,omitempty"`
+	DriveType              *string `json:"driveType,omitempty" yaml:"driveType,omitempty"`
+	SizeBytes              *int64  `json:"sizeBytes,omitempty" yaml:"sizeBytes,omitempty"`
+	PhysicalBlockSizeBytes *int64  `json:"physicalBlockSizeBytes,omitempty" yaml:"physicalBlockSizeBytes,omitempty"`
+	Vendor                 *string `json:"vendor,omitempty" yaml:"vendor,omitempty"`
+	Model                  *string `json:"model,omitempty" yaml:"model,omitempty"`
+	WWN                    *string `json:"wwn,omitempty" yaml:"wwn,omitempty"`
+	SerialNumber           *string `json:"serialNumber,omitempty" yaml:"serialNumber,omitempty"`
+	// Path is the device's position in the topology (udev ID_PATH, e.g.
+	// "pci-0000:17:00.0-nvme-1"): stable where Name is not, and identifies the
+	// slot rather than the drive (see WWN, SerialNumber).
+	Path *string `json:"path,omitempty" yaml:"path,omitempty"`
+}
+
+type Network struct {
+	Name                *string         `json:"name,omitempty" yaml:"name,omitempty"`
+	Mac                 *string         `json:"mac,omitempty" yaml:"mac,omitempty"`
+	SpeedMbps           *uint32         `json:"speedMbps,omitempty" yaml:"speedMbps,omitempty"`
+	EnabledCapabilities []string        `json:"enabledCapabilities,omitempty" yaml:"enabledCapabilities,omitempty"`
+	LLDPNeighbors       []*LLDPNeighbor `json:"lldpNeighbors,omitempty" yaml:"lldpNeighbors,omitempty"`
+}
+
+// LLDPNeighbor is a switch (or other LLDP-speaking device) discovered on the
+// other end of a Network interface's port.
+type LLDPNeighbor struct {
+	ChassisID       *string `json:"chassisID,omitempty" yaml:"chassisID,omitempty"`
+	SystemName      *string `json:"systemName,omitempty" yaml:"systemName,omitempty"`
+	PortID          *string `json:"portID,omitempty" yaml:"portID,omitempty"`
+	PortDescription *string `json:"portDescription,omitempty" yaml:"portDescription,omitempty"`
+}
+
+type PCI struct {
+	Vendor  *string `json:"vendor,omitempty" yaml:"vendor,omitempty"`
+	Product *string `json:"product,omitempty" yaml:"product,omitempty"`
+	Class   *string `json:"class,omitempty" yaml:"class,omitempty"`
+	Driver  *string `json:"driver,omitempty" yaml:"driver,omitempty"`
+}
+
+type GPU struct {
+	Vendor  *string `json:"vendor,omitempty" yaml:"vendor,omitempty"`
+	Product *string `json:"product,omitempty" yaml:"product,omitempty"`
+	Class   *string `json:"class,omitempty" yaml:"class,omitempty"`
+	Driver  *string `json:"driver,omitempty" yaml:"driver,omitempty"`
+}
+
+type Chassis struct {
+	Serial *string `json:"serial,omitempty" yaml:"serial,omitempty"`
+	Vendor *string `json:"vendor,omitempty" yaml:"vendor,omitempty"`
+}
+
+type BIOS struct {
+	Vendor      *string `json:"vendor,omitempty" yaml:"vendor,omitempty"`
+	Version     *string `json:"version,omitempty" yaml:"version,omitempty"`
+	ReleaseDate *string `json:"releaseDate,omitempty" yaml:"releaseDate,omitempty"`
+}
+
+type Baseboard struct {
+	Vendor       *string `json:"vendor,omitempty" yaml:"vendor,omitempty"`
+	Product      *string `json:"product,omitempty" yaml:"product,omitempty"`
+	Version      *string `json:"version,omitempty" yaml:"version,omitempty"`
+	SerialNumber *string `json:"serialNumber,omitempty" yaml:"serialNumber,omitempty"`
+}
+
+type Product struct {
+	Name         *string `json:"name,omitempty" yaml:"name,omitempty"`
+	Vendor       *string `json:"vendor,omitempty" yaml:"vendor,omitempty"`
+	SerialNumber *string `json:"serialNumber,omitempty" yaml:"serialNumber,omitempty"`
+}
+
+// NewAgentAttributes initializes a new AgentAttributes struct.
+func NewAgentAttributes() *AgentAttributes {
+	return &AgentAttributes{
+		CPU:               &CPU{},
+		Memory:            &Memory{},
+		BlockDevices:      []*Block{},
+		NetworkInterfaces: []*Network{},
+		PCIDevices:        []*PCI{},
+		GPUDevices:        []*GPU{},
+		Chassis:           &Chassis{},
+		BIOS:              &BIOS{},
+		Baseboard:         &Baseboard{},
+		Product:           &Product{},
+	}
+}

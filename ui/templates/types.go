@@ -1,0 +1,638 @@
+package templates
+
+import (
+	"strconv"
+	"strings"
+)
+
+// PageConfig holds common page configuration.
+type PageConfig struct {
+	BaseURL    string   // URL prefix for all routes (e.g., "/ui")
+	Namespaces []string // Available namespaces
+}
+
+// NavItem represents a navigation menu item.
+type NavItem struct {
+	Name string
+	Icon string
+	Href string
+}
+
+// Hardware represents a hardware resource in the list view.
+type Hardware struct {
+	Name        string
+	Namespace   string
+	Description string
+	MAC         string
+	IPv4Address string
+	Status      string
+	CreatedAt   string
+}
+
+// Workflow represents a workflow resource in the list view.
+type Workflow struct {
+	Name        string
+	Namespace   string
+	TemplateRef string
+	State       string
+	Disabled    bool
+	// CanUpdate reports whether the current user has permission to enable
+	// this Workflow. Checked once per list render, not per row.
+	CanUpdate bool
+	Task      string
+	Action    string
+	Agent     string
+	CreatedAt string
+}
+
+// WorkflowRuleSet represents a workflowruleset resource in the list view.
+type WorkflowRuleSet struct {
+	Name        string
+	Namespace   string
+	Rules       string
+	TemplateRef string
+	CreatedAt   string
+}
+
+// Template represents a template resource in the list view.
+type Template struct {
+	Name      string
+	Namespace string
+	State     string
+	Data      string
+	CreatedAt string
+}
+
+// BMCMachine represents a BMC machine resource in the list view.
+type BMCMachine struct {
+	Name        string
+	Namespace   string
+	PowerState  string
+	Contactable string
+	Endpoint    string
+	CreatedAt   string
+}
+
+// BMCJob represents a BMC job resource in the list view.
+type BMCJob struct {
+	Name        string
+	Namespace   string
+	MachineRef  string
+	Status      string
+	CompletedAt string
+	CreatedAt   string
+}
+
+// BMCTask represents a BMC task resource in the list view.
+type BMCTask struct {
+	Name        string
+	Namespace   string
+	JobRef      string
+	TaskType    string
+	Status      string
+	CompletedAt string
+	CreatedAt   string
+}
+
+// Permission represents a Kubernetes RBAC permission for a Tinkerbell resource.
+type Permission struct {
+	Resource  string
+	APIGroup  string
+	Namespace string   // Namespace scope (empty means cluster-wide)
+	Verbs     []string // Allowed verbs for this resource
+}
+
+// ResourceInfo represents a Tinkerbell resource for the permissions loading page.
+type ResourceInfo struct {
+	Resource string
+	APIGroup string
+}
+
+// PaginationData holds pagination state for list views.
+type PaginationData struct {
+	CurrentPage  int
+	TotalPages   int
+	TotalItems   int
+	ItemsPerPage int
+	StartItem    int
+	EndItem      int
+	ResourcePath string // e.g., "/hardware", "/workflows", "/templates"
+	TargetID     string // e.g., "#hardware-content", "#workflow-content"
+}
+
+// HardwarePageData is the data for the hardware list page.
+type HardwarePageData struct {
+	Hardware   []Hardware
+	Pagination PaginationData
+}
+
+// WorkflowPageData is the data for the workflow list page.
+type WorkflowPageData struct {
+	Workflows  []Workflow
+	Pagination PaginationData
+}
+
+// WorkflowRuleSetPageData is the data for the workflowruleset list page.
+type WorkflowRuleSetPageData struct {
+	RuleSets   []WorkflowRuleSet
+	Pagination PaginationData
+}
+
+// TemplatePageData is the data for the template list page.
+type TemplatePageData struct {
+	Templates  []Template
+	Pagination PaginationData
+}
+
+// BMCMachinePageData is the data for the BMC machine list page.
+type BMCMachinePageData struct {
+	Machines   []BMCMachine
+	Pagination PaginationData
+}
+
+// BMCJobPageData is the data for the BMC job list page.
+type BMCJobPageData struct {
+	Jobs       []BMCJob
+	Pagination PaginationData
+}
+
+// BMCTaskPageData is the data for the BMC task list page.
+type BMCTaskPageData struct {
+	Tasks      []BMCTask
+	Pagination PaginationData
+}
+
+// HardwareInterface represents a single network interface.
+type HardwareInterface struct {
+	MAC string
+	IP  string
+}
+
+// AgentProcessor represents a processor from agent attributes.
+type AgentProcessor struct {
+	ID           int      `json:"id"`
+	Cores        int      `json:"cores"`
+	Threads      int      `json:"threads"`
+	Vendor       string   `json:"vendor"`
+	Model        string   `json:"model"`
+	Capabilities []string `json:"capabilities"`
+}
+
+// AgentCPU represents CPU information from agent attributes.
+type AgentCPU struct {
+	TotalCores   int              `json:"totalCores"`
+	TotalThreads int              `json:"totalThreads"`
+	Processors   []AgentProcessor `json:"processors"`
+}
+
+// AgentMemory represents memory information from agent attributes.
+type AgentMemory struct {
+	Total  string `json:"total"`
+	Usable string `json:"usable"`
+}
+
+// AgentBlockDevice represents a block device from agent attributes.
+type AgentBlockDevice struct {
+	Name              string `json:"name"`
+	Size              string `json:"size"`
+	ControllerType    string `json:"controllerType"`
+	DriveType         string `json:"driveType"`
+	PhysicalBlockSize string `json:"physicalBlockSize"`
+	Vendor            string `json:"vendor"`
+	Model             string `json:"model"`
+	WWN               string `json:"wwn"`
+	SerialNumber      string `json:"serialNumber"`
+	Path              string `json:"path"`
+}
+
+// AgentNetworkInterface represents a network interface from agent attributes.
+type AgentNetworkInterface struct {
+	Name                string              `json:"name"`
+	MAC                 string              `json:"mac"`
+	Speed               string              `json:"speed"`
+	EnabledCapabilities []string            `json:"enabledCapabilities"`
+	LLDPNeighbors       []AgentLLDPNeighbor `json:"lldpNeighbors"`
+}
+
+// AgentLLDPNeighbor represents a switch (or other LLDP-speaking device)
+// discovered via LLDP on a network port.
+type AgentLLDPNeighbor struct {
+	ChassisID       string `json:"chassisID"`
+	SystemName      string `json:"systemName"`
+	PortID          string `json:"portID"`
+	PortDescription string `json:"portDescription"`
+}
+
+// AgentPCIDevice represents a PCI device from agent attributes.
+type AgentPCIDevice struct {
+	Vendor  string `json:"vendor"`
+	Product string `json:"product"`
+	Class   string `json:"class"`
+	Driver  string `json:"driver"`
+}
+
+// AgentGPUDevice represents a GPU device from agent attributes.
+type AgentGPUDevice struct {
+	Vendor  string `json:"vendor"`
+	Product string `json:"product"`
+	Class   string `json:"class"`
+	Driver  string `json:"driver"`
+}
+
+// AgentChassis represents chassis information from agent attributes.
+type AgentChassis struct {
+	Serial string `json:"serial"`
+	Vendor string `json:"vendor"`
+}
+
+// AgentBIOS represents BIOS information from agent attributes.
+type AgentBIOS struct {
+	Vendor      string `json:"vendor"`
+	Version     string `json:"version"`
+	ReleaseDate string `json:"releaseDate"`
+}
+
+// AgentBaseboard represents baseboard information from agent attributes.
+type AgentBaseboard struct {
+	Vendor       string `json:"vendor"`
+	Product      string `json:"product"`
+	Version      string `json:"version"`
+	SerialNumber string `json:"serialNumber"`
+}
+
+// AgentProduct represents product information from agent attributes.
+type AgentProduct struct {
+	Name         string `json:"name"`
+	Vendor       string `json:"vendor"`
+	SerialNumber string `json:"serialNumber"`
+}
+
+// AgentAttributes is the shape the "In-Band Attributes" section of the
+// Hardware detail page renders, built from Hardware.status.attributes.inBand
+// by AgentAttributesFromInBand.
+type AgentAttributes struct {
+	CPU               AgentCPU                `json:"cpu"`
+	Memory            AgentMemory             `json:"memory"`
+	BlockDevices      []AgentBlockDevice      `json:"blockDevices"`
+	NetworkInterfaces []AgentNetworkInterface `json:"networkInterfaces"`
+	PCIDevices        []AgentPCIDevice        `json:"pciDevices"`
+	GPUDevices        []AgentGPUDevice        `json:"gpuDevices"`
+	Chassis           AgentChassis            `json:"chassis"`
+	BIOS              AgentBIOS               `json:"bios"`
+	Baseboard         AgentBaseboard          `json:"baseboard"`
+	Product           AgentProduct            `json:"product"`
+}
+
+// HardwareDetail is the data for the hardware detail page.
+type HardwareDetail struct {
+	Name            string
+	Namespace       string
+	Interfaces      []HardwareInterface
+	Status          string
+	CreatedAt       string
+	Labels          map[string]string
+	Annotations     map[string]string
+	AgentAttributes *AgentAttributes
+	OutOfBand       *OutOfBandAttributes
+	SpecYAML        string
+	StatusYAML      string
+	YAML            string
+}
+
+// OOBStatus is health/state info for a component, as reported out-of-band.
+// Mirrors api/v1alpha1/tinkerbell.ComponentStatus, flattened to a value type
+// for template convenience.
+type OOBStatus struct {
+	Health string
+	State  string
+	// PostCode is a pointer because 0 is a meaningful POST code (success).
+	// Only meaningful on BIOS.
+	PostCode       *int32
+	PostCodeStatus string
+}
+
+// OOBComponent is a basic hardware component without specialized fields, e.g.
+// a baseboard, chassis, or storage controller.
+type OOBComponent struct {
+	Vendor          string
+	Model           string
+	SerialNumber    string
+	Description     string
+	FirmwareVersion string
+	Status          OOBStatus
+}
+
+// OOBProduct describes the overall system identity as reported out-of-band —
+// the machine's own asset details, distinct from any individual component.
+type OOBProduct struct {
+	Name         string
+	Vendor       string
+	Model        string
+	SerialNumber string
+	Status       OOBStatus
+}
+
+// OOBBIOS describes the system BIOS firmware as reported out-of-band.
+type OOBBIOS struct {
+	Vendor          string
+	Model           string
+	SerialNumber    string
+	FirmwareVersion string
+	ReleaseDate     string
+	Status          OOBStatus
+}
+
+// OOBBMC describes the BMC's own firmware and management NIC.
+type OOBBMC struct {
+	Vendor          string
+	Model           string
+	SerialNumber    string
+	FirmwareVersion string
+	NIC             *OOBNetworkInterface
+	Status          OOBStatus
+}
+
+// OOBCPUSocket describes a single physical CPU as reported out-of-band.
+type OOBCPUSocket struct {
+	Slot            string
+	Vendor          string
+	Model           string
+	Cores           uint32
+	Threads         uint32
+	ClockSpeedMHz   uint32
+	SerialNumber    string
+	FirmwareVersion string
+}
+
+// OOBMemoryModule describes a single memory module as reported out-of-band.
+type OOBMemoryModule struct {
+	Slot            string
+	Vendor          string
+	Model           string
+	SerialNumber    string
+	PartNumber      string
+	SizeBytes       int64
+	SpeedMHz        uint32
+	FormFactor      string
+	FirmwareVersion string
+}
+
+// OOBNetworkInterface describes a network adapter as reported out-of-band.
+type OOBNetworkInterface struct {
+	Vendor          string
+	Model           string
+	SerialNumber    string
+	FirmwareVersion string
+	Ports           []OOBNetworkPort
+}
+
+// OOBNetworkPort describes a single physical port on a network adapter.
+type OOBNetworkPort struct {
+	PortID     string
+	MAC        string
+	LinkStatus string
+	SpeedMbps  uint32
+	MTU        uint32
+}
+
+// MACAddresses joins every port's MAC address for display in a single table
+// cell, since a NIC can have multiple physical ports.
+func (n OOBNetworkInterface) MACAddresses() string {
+	var macs []string
+	for _, p := range n.Ports {
+		if p.MAC != "" {
+			macs = append(macs, p.MAC)
+		}
+	}
+	return strings.Join(macs, ", ")
+}
+
+// PortSpeeds joins every port's speed (e.g. "25000 Mbps") for display in a
+// single table cell, since a NIC can have multiple physical ports.
+func (n OOBNetworkInterface) PortSpeeds() string {
+	var speeds []string
+	for _, p := range n.Ports {
+		if p.SpeedMbps > 0 {
+			speeds = append(speeds, strconv.Itoa(int(p.SpeedMbps))+" Mbps")
+		}
+	}
+	return strings.Join(speeds, ", ")
+}
+
+// OOBBlockDevice describes a storage drive as reported out-of-band.
+type OOBBlockDevice struct {
+	ControllerType  string
+	DriveType       string
+	Vendor          string
+	Model           string
+	SerialNumber    string
+	WWN             string
+	SizeBytes       int64
+	SmartStatus     string
+	FirmwareVersion string
+	Status          OOBStatus
+}
+
+// OOBPSU describes a power supply unit as reported out-of-band.
+type OOBPSU struct {
+	Vendor             string
+	Model              string
+	SerialNumber       string
+	Description        string
+	FirmwareVersion    string
+	PowerCapacityWatts int64
+	Status             OOBStatus
+}
+
+// OOBTPM describes a trusted platform module as reported out-of-band.
+type OOBTPM struct {
+	Vendor          string
+	Model           string
+	SerialNumber    string
+	InterfaceType   string
+	FirmwareVersion string
+	Status          OOBStatus
+}
+
+// OOBGPU describes a GPU or accelerator device as reported out-of-band.
+type OOBGPU struct {
+	Vendor          string
+	Model           string
+	SerialNumber    string
+	Description     string
+	FirmwareVersion string
+	Status          OOBStatus
+}
+
+// OutOfBandAttributes is hardware data collected out-of-band via the BMC,
+// mirroring api/v1alpha1/tinkerbell.Attributes (the
+// status.attributes.outOfBand subtree). Every field is optional: BMC
+// vendors/protocols vary widely in what they report, so an empty field here
+// reflects what the BMC/collection driver reports, not an error.
+type OutOfBandAttributes struct {
+	LastUpdated        string // pre-formatted, same convention as HardwareDetail.CreatedAt
+	CollectionMethod   string
+	TotalCores         uint32
+	TotalThreads       uint32
+	CPUs               []OOBCPUSocket
+	TotalMemoryBytes   int64
+	MemoryModules      []OOBMemoryModule
+	Drives             []OOBBlockDevice
+	NICs               []OOBNetworkInterface
+	GPUs               []OOBGPU
+	Chassis            OOBComponent
+	Baseboard          OOBComponent
+	BIOS               OOBBIOS
+	Product            OOBProduct
+	BMC                OOBBMC
+	PSUs               []OOBPSU
+	TPMs               []OOBTPM
+	StorageControllers []OOBComponent
+}
+
+// WorkflowDetail is the data for the workflow detail page.
+type WorkflowDetail struct {
+	Name        string
+	Namespace   string
+	TemplateRef string
+	HardwareRef string
+	State       string
+	Disabled    bool
+	// CanUpdate reports whether the current user has permission to enable
+	// this Workflow.
+	CanUpdate         bool
+	Task              string
+	Action            string
+	Agent             string
+	TemplateRendering string
+	CreatedAt         string
+	Labels            map[string]string
+	Annotations       map[string]string
+	SpecYAML          string
+	StatusYAML        string
+	YAML              string
+}
+
+// TemplateDetail is the data for the template detail page.
+type TemplateDetail struct {
+	Name        string
+	Namespace   string
+	State       string
+	Data        string
+	CreatedAt   string
+	Labels      map[string]string
+	Annotations map[string]string
+	SpecYAML    string
+	StatusYAML  string
+	YAML        string
+}
+
+// WorkflowRuleSetDetail is the data for the workflowruleset detail page.
+type WorkflowRuleSetDetail struct {
+	Name              string
+	Namespace         string
+	YAMLData          string
+	CreatedAt         string
+	Labels            map[string]string
+	Annotations       map[string]string
+	Rules             []string
+	TemplateRef       string
+	WorkflowNamespace string
+	WorkflowDisabled  bool
+	AddAttributes     bool
+	AgentValue        string
+}
+
+// BMCMachineDetail is the data for the BMC machine detail page.
+type BMCMachineDetail struct {
+	Name        string
+	Namespace   string
+	PowerState  string
+	Contactable string
+	Endpoint    string
+	CreatedAt   string
+	Labels      map[string]string
+	Annotations map[string]string
+	SpecYAML    string
+	StatusYAML  string
+	YAML        string
+}
+
+// BMCJobDetail is the data for the BMC job detail page.
+type BMCJobDetail struct {
+	Name        string
+	Namespace   string
+	MachineRef  string
+	Status      string
+	CompletedAt string
+	CreatedAt   string
+	Labels      map[string]string
+	Annotations map[string]string
+	SpecYAML    string
+	StatusYAML  string
+	YAML        string
+}
+
+// BMCTaskDetail is the data for the BMC task detail page.
+type BMCTaskDetail struct {
+	Name        string
+	Namespace   string
+	JobRef      string
+	TaskType    string
+	Status      string
+	CompletedAt string
+	CreatedAt   string
+	Labels      map[string]string
+	Annotations map[string]string
+	SpecYAML    string
+	StatusYAML  string
+	YAML        string
+}
+
+// InfoRow represents a single row in a NameValueTable.
+type InfoRow struct {
+	Name  string
+	Value string
+	Link  string // If set, Value is rendered as a hyperlink to this URL.
+	Hide  bool
+}
+
+// SchemaField represents a field in a CRD schema for display.
+type SchemaField struct {
+	Name        string        // Field name
+	Type        string        // Field type (string, integer, boolean, object, array)
+	Description string        // Field description from CRD
+	Required    bool          // Whether the field is required
+	Deprecated  bool          // Whether the field is deprecated
+	Children    []SchemaField // Nested fields for objects/arrays
+	Pattern     string        // Regex pattern for validation (if any)
+	Enum        []string      // Allowed enum values (if any)
+	Default     string        // Default value (if any)
+	Format      string        // Format hint (date-time, int64, uri, etc.)
+}
+
+// CRDInfo represents a Custom Resource Definition for display on the dashboard.
+type CRDInfo struct {
+	Kind         string        // Resource kind (e.g., "Hardware")
+	Plural       string        // Plural name (e.g., "hardware")
+	Group        string        // API group (e.g., "tinkerbell.org")
+	Version      string        // API version (e.g., "v1alpha1")
+	Description  string        // CRD description
+	Route        string        // Web UI route (empty if no UI exists)
+	SpecFields   []SchemaField // Top-level spec fields
+	StatusFields []SchemaField // Top-level status fields
+}
+
+// CRDGroup represents a group of CRDs for display.
+type CRDGroup struct {
+	Name string    // Group name (e.g., "tinkerbell.org")
+	CRDs []CRDInfo // CRDs in this group
+}
+
+// DashboardData is the data for the landing page/dashboard.
+type DashboardData struct {
+	Groups            []CRDGroup // CRDs grouped by API group
+	SelectedVersion   string     // Currently selected API version (e.g., "v1alpha1")
+	AvailableVersions []string   // All available API versions (e.g., ["v1alpha1", "v1alpha2"])
+	BaseURL           string     // URL prefix for HTMX requests
+}

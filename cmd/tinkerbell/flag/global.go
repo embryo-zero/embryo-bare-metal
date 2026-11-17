@@ -1,0 +1,306 @@
+package flag
+
+import (
+	"fmt"
+	"net/netip"
+	"strings"
+
+	"github.com/peterbourgon/ff/v4/ffval"
+	"github.com/tinkerbell/tinkerbell/pkg/constant"
+	"github.com/tinkerbell/tinkerbell/pkg/flag/delimitedlist"
+	ntip "github.com/tinkerbell/tinkerbell/pkg/flag/netip"
+	"k8s.io/apimachinery/pkg/util/validation"
+)
+
+type GlobalConfig struct {
+	LogLevel              int
+	Backend               string
+	BackendFilePath       string
+	BackendKubeConfig     string
+	BackendKubeNamespaces []string
+	OTELEndpoint          string
+	OTELInsecure          bool
+	TrustedProxies        []netip.Prefix
+	ListenerFamilies      constant.ListenerFamilies
+	PublicIP              netip.Addr
+	PublicIPv6            netip.Addr
+	BindAddr              netip.Addr
+	BindAddrV6            netip.Addr
+	HTTPPort              int
+	HTTPPortV6            int
+	HTTPSPort             int
+	HTTPSPortV6           int
+	EnableSmee            bool
+	EnableTootles         bool
+	EnableTinkServer      bool
+	EnableTinkController  bool
+	EnableRufio           bool
+	EnableSecondStar      bool
+	EnableUI              bool
+	EnableCRDMigrations   bool
+	EmbeddedGlobalConfig  EmbeddedGlobalConfig
+	BackendKubeOptions    BackendKubeOptions
+	TLS                   TLSConfig
+	PrintVersion          bool
+}
+
+type EmbeddedGlobalConfig struct {
+	EnableKubeAPIServer bool
+	EnableETCD          bool
+	KubeAPIServerPKIDir string
+}
+
+type BackendKubeOptions struct {
+	QPS                             float32
+	Burst                           int
+	HardwareReferenceAllowListRules []string
+	HardwareReferenceDenyListRules  []string
+	Rendering                       bool
+}
+
+type TLSConfig struct {
+	CertFile                   string
+	KeyFile                    string
+	DisableHTTPToHTTPSRedirect bool
+}
+
+const (
+	logLevelUsage = "the higher the number the more verbose, level 0 inherits the global log level, a negative number disables logging"
+)
+
+func RegisterGlobal(fs *Set, gc *GlobalConfig) {
+	fs.Register(BackendConfig, ffval.NewEnum(&gc.Backend, "kube", "file", "none"))
+	fs.Register(ListenerFamiliesConfig, &ffval.Enum[constant.ListenerFamilies]{
+		ParseFunc: func(s string) (constant.ListenerFamilies, error) { return constant.ListenerFamilies(s), nil },
+		Valid:     []constant.ListenerFamilies{constant.ListenerFamiliesIPv4, constant.ListenerFamiliesIPv6, constant.ListenerFamiliesDual},
+		Pointer:   &gc.ListenerFamilies,
+		Default:   gc.ListenerFamilies,
+	})
+	fs.Register(BackendFilePath, ffval.NewValueDefault(&gc.BackendFilePath, gc.BackendFilePath))
+	fs.Register(KubeBurst, ffval.NewValueDefault(&gc.BackendKubeOptions.Burst, gc.BackendKubeOptions.Burst))
+	fs.Register(BackendKubeConfig, ffval.NewValueDefault(&gc.BackendKubeConfig, gc.BackendKubeConfig))
+	fs.Register(BackendKubeNamespace, delimitedlist.NewParsed(&gc.BackendKubeNamespaces, ',', parseNamespace,
+		delimitedlist.Accumulate[string](),
+		delimitedlist.Dedupe[string](),
+		delimitedlist.Placeholder[string]("NAMESPACES"),
+	))
+	fs.Register(KubeQPS, ffval.NewValueDefault(&gc.BackendKubeOptions.QPS, gc.BackendKubeOptions.QPS))
+	fs.Register(BackendKubeHardwareReferenceAllowListRules, delimitedlist.New(&gc.BackendKubeOptions.HardwareReferenceAllowListRules, '|'))
+	fs.Register(BackendKubeHardwareReferenceDenyListRules, delimitedlist.New(&gc.BackendKubeOptions.HardwareReferenceDenyListRules, '|'))
+	fs.Register(KubeRendering, ffval.NewValueDefault(&gc.BackendKubeOptions.Rendering, gc.BackendKubeOptions.Rendering))
+	fs.RegisterFamily(BindAddr, V4, &ntip.Addr{Addr: &gc.BindAddr})
+	fs.RegisterFamily(BindAddr, V6, &ntip.Addr{Addr: &gc.BindAddrV6})
+	fs.RegisterFamily(HTTPPort, V4, ffval.NewValueDefault(&gc.HTTPPort, gc.HTTPPort))
+	fs.RegisterFamily(HTTPPort, V6, ffval.NewValueDefault(&gc.HTTPPortV6, gc.HTTPPortV6))
+	fs.RegisterFamily(HTTPSPort, V4, ffval.NewValueDefault(&gc.HTTPSPort, gc.HTTPSPort))
+	fs.RegisterFamily(HTTPSPort, V6, ffval.NewValueDefault(&gc.HTTPSPortV6, gc.HTTPSPortV6))
+	fs.Register(EnableSmee, ffval.NewValueDefault(&gc.EnableSmee, gc.EnableSmee))
+	fs.Register(EnableTootles, ffval.NewValueDefault(&gc.EnableTootles, gc.EnableTootles))
+	fs.Register(EnableTinkServer, ffval.NewValueDefault(&gc.EnableTinkServer, gc.EnableTinkServer))
+	fs.Register(EnableTinkController, ffval.NewValueDefault(&gc.EnableTinkController, gc.EnableTinkController))
+	fs.Register(EnableRufioController, ffval.NewValueDefault(&gc.EnableRufio, gc.EnableRufio))
+	fs.Register(EnableSecondStar, ffval.NewValueDefault(&gc.EnableSecondStar, gc.EnableSecondStar))
+	fs.Register(EnableUI, ffval.NewValueDefault(&gc.EnableUI, gc.EnableUI))
+	fs.Register(EnableCRDMigrations, ffval.NewValueDefault(&gc.EnableCRDMigrations, gc.EnableCRDMigrations))
+	fs.Register(LogLevelConfig, ffval.NewValueDefault(&gc.LogLevel, gc.LogLevel))
+	fs.Register(OTELEndpoint, ffval.NewValueDefault(&gc.OTELEndpoint, gc.OTELEndpoint))
+	fs.Register(OTELInsecure, ffval.NewValueDefault(&gc.OTELInsecure, gc.OTELInsecure))
+	fs.RegisterFamily(PublicIP, V4, &ntip.Addr{Addr: &gc.PublicIP})
+	fs.RegisterFamily(PublicIP, V6, &ntip.Addr{Addr: &gc.PublicIPv6})
+	fs.Register(TLSCertFile, ffval.NewValueDefault(&gc.TLS.CertFile, gc.TLS.CertFile))
+	fs.Register(TLSKeyFile, ffval.NewValueDefault(&gc.TLS.KeyFile, gc.TLS.KeyFile))
+	fs.Register(DisableHTTPToHTTPSRedirect, ffval.NewValueDefault(&gc.TLS.DisableHTTPToHTTPSRedirect, gc.TLS.DisableHTTPToHTTPSRedirect))
+	fs.Register(TrustedProxies, &ntip.PrefixList{PrefixList: &gc.TrustedProxies})
+	fs.Register(PrintVersion, ffval.NewValueDefault(&gc.PrintVersion, gc.PrintVersion))
+}
+
+func RegisterEmbeddedGlobals(fs *Set, gc *GlobalConfig) {
+	fs.Register(EnableKubeAPIServer, ffval.NewValueDefault(&gc.EmbeddedGlobalConfig.EnableKubeAPIServer, gc.EmbeddedGlobalConfig.EnableKubeAPIServer))
+	fs.Register(EnableETCD, ffval.NewValueDefault(&gc.EmbeddedGlobalConfig.EnableETCD, gc.EmbeddedGlobalConfig.EnableETCD))
+	fs.Register(KubeAPIServerPKIDir, ffval.NewValueDefault(&gc.EmbeddedGlobalConfig.KubeAPIServerPKIDir, gc.EmbeddedGlobalConfig.KubeAPIServerPKIDir))
+}
+
+// All these flags are used by at least two services or
+// are used to create objects that are used by multiple services.
+var LogLevelConfig = Config{
+	Name:  "log-level",
+	Usage: "the higher the number the more verbose, a negative number disables logging",
+}
+
+// BackendConfig flags.
+var BackendConfig = Config{
+	Name:  "backend",
+	Usage: "backend to use (kube, file, none)",
+}
+
+// ListenerFamiliesConfig selects the address families every listener serves.
+// Per-service enable flags still decide which services run.
+var ListenerFamiliesConfig = Config{
+	Name:  "listener-families",
+	Usage: "IP address families to listen on (ipv4, ipv6, dual)",
+}
+
+var BackendFilePath = Config{
+	Name:  "backend-file-path",
+	Usage: "[file] path to the file backend, this is only implemented when running only the Smee service",
+}
+
+// Kube backend flags.
+var BackendKubeConfig = Config{
+	Name:  "backend-kube-config",
+	Usage: "[kube] path to the kubeconfig file",
+}
+
+var BackendKubeNamespace = Config{
+	Name:  "backend-kube-namespace",
+	Usage: "[kube] namespace all services read and write; repeat or comma-separate for several; empty means all namespaces",
+}
+
+// parseNamespace validates one Kubernetes namespace name.
+func parseNamespace(s string) (string, error) {
+	if errs := validation.IsDNS1123Label(s); len(errs) > 0 {
+		return "", fmt.Errorf("invalid namespace %q: %s", s, strings.Join(errs, "; "))
+	}
+	return s, nil
+}
+
+var KubeQPS = Config{
+	Name:  "backend-kube-qps",
+	Usage: "[kube] maximum queries per second to the Kubernetes API server. A 0 value equates to 5 (client sdk constraint). A negative value disables client-side ratelimiting.",
+}
+
+var KubeBurst = Config{
+	Name:  "backend-kube-burst",
+	Usage: "[kube] maximum burst for throttle in the Kubernetes client. A 0 value equates to 10 (client sdk constraint). A negative value disables client-side burst limiting.",
+}
+
+var BackendKubeHardwareReferenceAllowListRules = Config{
+	Name:  "backend-kube-hardware-reference-allow-list-rules",
+	Usage: "[kube] rules for which Hardware Reference objects are accessible",
+}
+
+var BackendKubeHardwareReferenceDenyListRules = Config{
+	Name:  "backend-kube-hardware-reference-deny-list-rules",
+	Usage: "[kube] rules for which Hardware Reference objects are not accessible, defaults to deny all",
+}
+
+var KubeRendering = Config{
+	Name:  "backend-kube-rendering-enabled",
+	Usage: "[kube] render templates in Hardware specs",
+}
+
+// OTEL flags.
+var OTELEndpoint = Config{
+	Name:  "otel-endpoint",
+	Usage: "[otel] OpenTelemetry collector endpoint",
+}
+
+var OTELInsecure = Config{
+	Name:  "otel-insecure",
+	Usage: "[otel] OpenTelemetry collector insecure",
+}
+
+// Shared flags.
+var TrustedProxies = Config{
+	Name:  "trusted-proxies",
+	Usage: "list of trusted proxies in CIDR notation",
+}
+
+var PublicIP = Config{
+	Name:  "public-ip",
+	Usage: "public address to advertise to clients",
+}
+
+var EnableSmee = Config{
+	Name:  "enable-smee",
+	Usage: "enable Smee service",
+}
+
+var EnableTootles = Config{
+	Name:  "enable-tootles",
+	Usage: "enable Tootles service",
+}
+
+var EnableTinkServer = Config{
+	Name:  "enable-tink-server",
+	Usage: "enable Tink Server service",
+}
+
+var EnableTinkController = Config{
+	Name:  "enable-tink-controller",
+	Usage: "enable Tink Controller service",
+}
+
+var EnableRufioController = Config{
+	Name:  "enable-rufio-controller",
+	Usage: "enable Rufio Controller service",
+}
+
+var EnableSecondStar = Config{
+	Name:  "enable-secondstar",
+	Usage: "enable SecondStar service",
+}
+
+var EnableUI = Config{
+	Name:  "enable-ui",
+	Usage: "enable UI service",
+}
+
+var EnableKubeAPIServer = Config{
+	Name:  "enable-embedded-kube-apiserver",
+	Usage: "enables the embedded kube-apiserver",
+}
+
+var EnableETCD = Config{
+	Name:  "enable-embedded-etcd",
+	Usage: "enables the embedded etcd",
+}
+
+var KubeAPIServerPKIDir = Config{
+	Name: "kube-apiserver-pki-dir",
+	Usage: "directory holding the embedded kube-apiserver's CA, serving certificate, service account key, and admin kubeconfig; " +
+		"they are generated on first start unless --kube-apiserver-tls-cert-file, --kube-apiserver-tls-private-key-file, --client-ca-file, " +
+		"--service-account-key-file, --service-account-signing-key-file, or --backend-kube-config is set to a non-empty value; " +
+		"it and its files must not be writable by other users",
+}
+
+var EnableCRDMigrations = Config{
+	Name:  "enable-crd-migrations",
+	Usage: "create CRDs in the cluster; defaults to false when the backend namespace is set",
+}
+
+var BindAddr = Config{
+	Name:  "bind-address",
+	Usage: "default address to which to bind shared services",
+}
+
+// TLS flags
+var TLSCertFile = Config{
+	Name:  "tls-cert-file",
+	Usage: "[tls] path to the TLS certificate file",
+}
+
+var TLSKeyFile = Config{
+	Name:  "tls-key-file",
+	Usage: "[tls] path to the TLS key file",
+}
+
+var DisableHTTPToHTTPSRedirect = Config{
+	Name:  "disable-http-to-https-redirect",
+	Usage: "[tls] disable HTTP to HTTPS redirects even when TLS is configured",
+}
+
+var HTTPPort = Config{
+	Name:  "http-port",
+	Usage: "port for the HTTP server",
+}
+
+var HTTPSPort = Config{
+	Name:  "https-port",
+	Usage: "port for the HTTPS server, unused when no TLS cert and key are provided",
+}
+
+var PrintVersion = Config{
+	Name:  "version",
+	Usage: "print the version and exit",
+}

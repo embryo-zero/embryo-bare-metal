@@ -1,0 +1,1540 @@
+package grpc
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/tinkerbell/tinkerbell/api/v1alpha1/tinkerbell"
+	"github.com/tinkerbell/tinkerbell/pkg/constant"
+	"github.com/tinkerbell/tinkerbell/pkg/data"
+	"github.com/tinkerbell/tinkerbell/pkg/proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+func TestGetAction(t *testing.T) {
+	cases := map[string]struct {
+		workflow *tinkerbell.Workflow
+		request  *proto.ActionRequest
+		want     *proto.ActionResponse
+		wantErr  error
+	}{
+		"successful second Action in Task": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State: tinkerbell.WorkflowStateRunning,
+					CurrentState: &tinkerbell.CurrentState{
+						AgentID:    "machine-mac-1",
+						TaskID:     "provision",
+						ActionID:   "stream",
+						State:      tinkerbell.WorkflowStateSuccess,
+						ActionName: "stream",
+					},
+					GlobalTimeout: 600,
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "provision",
+							AgentID: "machine-mac-1",
+							ID:      "provision",
+							Actions: []tinkerbell.Action{
+								{
+									Name:              "stream",
+									Image:             "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+									Timeout:           300,
+									State:             tinkerbell.WorkflowStateSuccess,
+									ExecutionStart:    nil,
+									ExecutionDuration: "30s",
+									ID:                "stream",
+								},
+								{
+									Name:    "kexec",
+									Image:   "quay.io/tinkerbell-actions/kexec:v1.0.0",
+									Timeout: 5,
+									State:   tinkerbell.WorkflowStatePending,
+									ID:      "kexec",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: &proto.ActionResponse{
+				WorkflowId:  toPtr("default/machine1"),
+				AgentId:     toPtr("machine-mac-1"),
+				TaskId:      toPtr("provision"),
+				ActionId:    toPtr("kexec"),
+				Name:        toPtr("kexec"),
+				Image:       toPtr("quay.io/tinkerbell-actions/kexec:v1.0.0"),
+				Timeout:     toPtr(int64(5)),
+				Environment: []string{},
+				Pid:         new(string),
+			},
+			wantErr: nil,
+		},
+		"successful first Action in Task": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			want: &proto.ActionResponse{
+				WorkflowId:  toPtr("default/machine1"),
+				AgentId:     toPtr("machine-mac-1"),
+				TaskId:      new(string),
+				ActionId:    new(string),
+				Name:        toPtr("stream"),
+				Image:       toPtr("quay.io/tinkerbell-actions/image2disk:v1.0.0"),
+				Timeout:     toPtr(int64(300)),
+				Environment: []string{},
+				Pid:         new(string),
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State:         tinkerbell.WorkflowStateRunning,
+					GlobalTimeout: 600,
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "provision",
+							AgentID: "machine-mac-1",
+							Actions: []tinkerbell.Action{
+								{
+									Name:              "stream",
+									Image:             "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+									Timeout:           300,
+									State:             tinkerbell.WorkflowStatePending,
+									ExecutionStart:    nil,
+									ExecutionDuration: "30s",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: nil,
+		},
+		"workflow with no Tasks": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State:         tinkerbell.WorkflowStateRunning,
+					GlobalTimeout: 600,
+					Tasks:         []tinkerbell.Task{},
+				},
+			},
+			wantErr: status.Errorf(codes.NotFound, "no Tasks found in Workflow"),
+		},
+		"no workflows found": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			wantErr: status.Errorf(codes.NotFound, "no Workflows found"),
+		},
+		"no agent id": {
+			request: &proto.ActionRequest{},
+			wantErr: status.Errorf(codes.InvalidArgument, "invalid Agent ID"),
+		},
+		"action with namespaces network host": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			want: &proto.ActionResponse{
+				WorkflowId:  toPtr("default/machine1"),
+				AgentId:     toPtr("machine-mac-1"),
+				TaskId:      new(string),
+				ActionId:    new(string),
+				Name:        toPtr("run-inventory"),
+				Image:       toPtr("example/inventory:latest"),
+				Timeout:     toPtr(int64(120)),
+				Environment: []string{},
+				Pid:         new(string),
+				Namespaces:  &proto.Namespaces{Network: toPtr("host"), Pid: new(string)},
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State:         tinkerbell.WorkflowStateRunning,
+					GlobalTimeout: 600,
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "inventory",
+							AgentID: "machine-mac-1",
+							Actions: []tinkerbell.Action{
+								{
+									Name:    "run-inventory",
+									Image:   "example/inventory:latest",
+									Timeout: 120,
+									State:   tinkerbell.WorkflowStatePending,
+									Namespaces: &tinkerbell.ActionNamespaces{
+										Network: "host",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: nil,
+		},
+		"action with namespaces pid preferred over top-level pid": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			want: &proto.ActionResponse{
+				WorkflowId:  toPtr("default/machine1"),
+				AgentId:     toPtr("machine-mac-1"),
+				TaskId:      new(string),
+				ActionId:    new(string),
+				Name:        toPtr("run-inventory"),
+				Image:       toPtr("example/inventory:latest"),
+				Timeout:     toPtr(int64(120)),
+				Environment: []string{},
+				Pid:         toPtr("host"),
+				Namespaces:  &proto.Namespaces{Network: toPtr("host"), Pid: toPtr("host")},
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State:         tinkerbell.WorkflowStateRunning,
+					GlobalTimeout: 600,
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "inventory",
+							AgentID: "machine-mac-1",
+							Actions: []tinkerbell.Action{
+								{
+									Name:    "run-inventory",
+									Image:   "example/inventory:latest",
+									Timeout: 120,
+									State:   tinkerbell.WorkflowStatePending,
+									Pid:     "legacy-value",
+									Namespaces: &tinkerbell.ActionNamespaces{
+										Network: "host",
+										PID:     "host",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: nil,
+		},
+		"re-serve running first Action after server restart": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State: tinkerbell.WorkflowStateRunning,
+					CurrentState: &tinkerbell.CurrentState{
+						AgentID:    "machine-mac-1",
+						TaskID:     "provision",
+						ActionID:   "stream",
+						State:      tinkerbell.WorkflowStateRunning,
+						ActionName: "stream",
+					},
+					GlobalTimeout: 600,
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "provision",
+							AgentID: "machine-mac-1",
+							ID:      "provision",
+							Actions: []tinkerbell.Action{
+								{
+									Name:    "stream",
+									Image:   "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+									Timeout: 300,
+									State:   tinkerbell.WorkflowStateRunning,
+									ID:      "stream",
+								},
+								{
+									Name:    "kexec",
+									Image:   "quay.io/tinkerbell-actions/kexec:v1.0.0",
+									Timeout: 5,
+									State:   tinkerbell.WorkflowStatePending,
+									ID:      "kexec",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: &proto.ActionResponse{
+				WorkflowId:  toPtr("default/machine1"),
+				AgentId:     toPtr("machine-mac-1"),
+				TaskId:      toPtr("provision"),
+				ActionId:    toPtr("stream"),
+				Name:        toPtr("stream"),
+				Image:       toPtr("quay.io/tinkerbell-actions/image2disk:v1.0.0"),
+				Timeout:     toPtr(int64(300)),
+				Environment: []string{},
+				Pid:         new(string),
+			},
+			wantErr: nil,
+		},
+		"re-serve running non-first Action after server restart": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State: tinkerbell.WorkflowStateRunning,
+					CurrentState: &tinkerbell.CurrentState{
+						AgentID:    "machine-mac-1",
+						TaskID:     "provision",
+						ActionID:   "kexec",
+						State:      tinkerbell.WorkflowStateRunning,
+						ActionName: "kexec",
+					},
+					GlobalTimeout: 600,
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "provision",
+							AgentID: "machine-mac-1",
+							ID:      "provision",
+							Actions: []tinkerbell.Action{
+								{
+									Name:    "stream",
+									Image:   "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+									Timeout: 300,
+									State:   tinkerbell.WorkflowStateSuccess,
+									ID:      "stream",
+								},
+								{
+									Name:    "kexec",
+									Image:   "quay.io/tinkerbell-actions/kexec:v1.0.0",
+									Timeout: 5,
+									State:   tinkerbell.WorkflowStateRunning,
+									ID:      "kexec",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: &proto.ActionResponse{
+				WorkflowId:  toPtr("default/machine1"),
+				AgentId:     toPtr("machine-mac-1"),
+				TaskId:      toPtr("provision"),
+				ActionId:    toPtr("kexec"),
+				Name:        toPtr("kexec"),
+				Image:       toPtr("quay.io/tinkerbell-actions/kexec:v1.0.0"),
+				Timeout:     toPtr(int64(5)),
+				Environment: []string{},
+				Pid:         new(string),
+			},
+			wantErr: nil,
+		},
+		"nil currentState with non-pending first action": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State:         tinkerbell.WorkflowStateRunning,
+					CurrentState:  nil,
+					GlobalTimeout: 600,
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "provision",
+							AgentID: "machine-mac-1",
+							ID:      "provision",
+							Actions: []tinkerbell.Action{
+								{
+									Name:    "stream",
+									Image:   "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+									Timeout: 300,
+									State:   tinkerbell.WorkflowStateSuccess,
+									ID:      "stream",
+								},
+								{
+									Name:    "kexec",
+									Image:   "quay.io/tinkerbell-actions/kexec:v1.0.0",
+									Timeout: 5,
+									State:   tinkerbell.WorkflowStatePending,
+									ID:      "kexec",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: status.Errorf(codes.FailedPrecondition, "no current state available"),
+		},
+		"re-serve pending non-first Action after server restart": {
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State: tinkerbell.WorkflowStateRunning,
+					CurrentState: &tinkerbell.CurrentState{
+						AgentID:    "machine-mac-1",
+						TaskID:     "provision",
+						ActionID:   "kexec",
+						State:      tinkerbell.WorkflowStatePending,
+						ActionName: "kexec",
+					},
+					GlobalTimeout: 600,
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "provision",
+							AgentID: "machine-mac-1",
+							ID:      "provision",
+							Actions: []tinkerbell.Action{
+								{
+									Name:    "stream",
+									Image:   "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+									Timeout: 300,
+									State:   tinkerbell.WorkflowStateSuccess,
+									ID:      "stream",
+								},
+								{
+									Name:    "kexec",
+									Image:   "quay.io/tinkerbell-actions/kexec:v1.0.0",
+									Timeout: 5,
+									State:   tinkerbell.WorkflowStatePending,
+									ID:      "kexec",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: &proto.ActionResponse{
+				WorkflowId:  toPtr("default/machine1"),
+				AgentId:     toPtr("machine-mac-1"),
+				TaskId:      toPtr("provision"),
+				ActionId:    toPtr("kexec"),
+				Name:        toPtr("kexec"),
+				Image:       toPtr("quay.io/tinkerbell-actions/kexec:v1.0.0"),
+				Timeout:     toPtr(int64(5)),
+				Environment: []string{},
+				Pid:         new(string),
+			},
+			wantErr: nil,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := &Handler{
+				Logger:  logr.FromSlogHandler(slog.NewJSONHandler(os.Stdout, nil)),
+				Backend: &mockBackendReadWriter{workflow: tc.workflow},
+				NowFunc: func() time.Time { return time.Time{} },
+			}
+
+			resp, gotErr := server.GetAction(context.Background(), tc.request)
+			compareErrors(t, gotErr, tc.wantErr)
+			if tc.want == nil {
+				return
+			}
+
+			if diff := cmp.Diff(resp, tc.want, cmpopts.IgnoreUnexported(proto.ActionResponse{}, proto.Namespaces{})); diff != "" {
+				t.Errorf("unexpected difference:\n%v", diff)
+			}
+		})
+	}
+}
+
+// compareErrors is a helper function for comparing an error value and a desired error.
+func compareErrors(t *testing.T, got, want error) {
+	t.Helper()
+	if got != nil {
+		if want == nil {
+			t.Fatalf(`Got unexpected error: %v"`, got)
+		} else if got.Error() != want.Error() {
+			t.Fatalf(`Got unexpected error: got "%v" wanted "%v"`, got, want)
+		}
+		return
+	}
+	if want != nil {
+		t.Fatalf("Missing expected error: %v", want)
+	}
+}
+
+type mockBackendReadWriter struct {
+	workflow    *tinkerbell.Workflow
+	writeErr    error
+	hardware    *tinkerbell.Hardware
+	hardwareErr error
+
+	readWorkflowFunc   func() (*tinkerbell.Workflow, error)
+	listWorkflowsFunc  func() ([]tinkerbell.Workflow, error)
+	updateWorkflowFunc func(*tinkerbell.Workflow) error
+	workflowReads      int
+	workflowLists      int
+	workflowUpdates    int
+
+	updatedHardware *tinkerbell.Hardware // captures the hardware passed to UpdateHardware
+	updateOpts      data.UpdateOptions   // captures the options passed to UpdateHardware
+
+	appliedInBand *tinkerbell.Attributes // captures the attrs passed to ApplyHardwareInBandAttributes
+
+	readHardwareCalls int // counts calls to ReadHardware, to catch redundant re-reads
+	hardwareFilter    data.HardwareFilter
+}
+
+func (m *mockBackendReadWriter) ReadWorkflow(_ context.Context, _ string, _ string) (*tinkerbell.Workflow, error) {
+	m.workflowReads++
+	if m.readWorkflowFunc != nil {
+		return m.readWorkflowFunc()
+	}
+	if m.workflow == nil {
+		return nil, errors.New("workflow not found")
+	}
+	return m.workflow, nil
+}
+
+func (m *mockBackendReadWriter) ListWorkflows(_ context.Context, _ data.WorkflowFilter) ([]tinkerbell.Workflow, error) {
+	m.workflowLists++
+	if m.listWorkflowsFunc != nil {
+		return m.listWorkflowsFunc()
+	}
+	if m.workflow != nil {
+		return []tinkerbell.Workflow{*m.workflow}, nil
+	}
+	return []tinkerbell.Workflow{}, nil
+}
+
+func (m *mockBackendReadWriter) UpdateWorkflow(_ context.Context, wf *tinkerbell.Workflow, _ data.UpdateOptions) error {
+	m.workflowUpdates++
+	if m.updateWorkflowFunc != nil {
+		return m.updateWorkflowFunc(wf)
+	}
+	return m.writeErr
+}
+
+func (m *mockBackendReadWriter) ReadHardware(_ context.Context, _ string, _ string) (*tinkerbell.Hardware, error) {
+	m.readHardwareCalls++
+	if m.hardware != nil {
+		return m.hardware, nil
+	}
+	if m.hardwareErr != nil {
+		return nil, m.hardwareErr
+	}
+	return nil, errors.New("hardware not found")
+}
+
+func (m *mockBackendReadWriter) FilterHardware(_ context.Context, f data.HardwareFilter) (*tinkerbell.Hardware, error) {
+	m.hardwareFilter = f
+	if m.hardware != nil {
+		return m.hardware, nil
+	}
+	if m.hardwareErr != nil {
+		return nil, m.hardwareErr
+	}
+	return nil, errors.New("hardware not found")
+}
+
+func (m *mockBackendReadWriter) UpdateHardware(_ context.Context, hw *tinkerbell.Hardware, opts data.UpdateOptions) error {
+	m.updatedHardware = hw
+	m.updateOpts = opts
+	return nil
+}
+
+func (m *mockBackendReadWriter) ApplyHardwareInBandAttributes(_ context.Context, _, _ string, attrs *tinkerbell.Attributes) error {
+	m.appliedInBand = attrs
+	return nil
+}
+
+func TestGetActionHardwareAttributes(t *testing.T) {
+	baseWorkflow := func(hardwareRef string) *tinkerbell.Workflow {
+		return &tinkerbell.Workflow{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "machine1",
+				Namespace: "default",
+			},
+			Spec: tinkerbell.WorkflowSpec{
+				HardwareRef: hardwareRef,
+			},
+			Status: tinkerbell.WorkflowStatus{
+				State:         tinkerbell.WorkflowStatePending,
+				GlobalTimeout: 600,
+				Tasks: []tinkerbell.Task{
+					{
+						Name:    "provision",
+						AgentID: "machine-mac-1",
+						Actions: []tinkerbell.Action{
+							{
+								Name:    "stream",
+								Image:   "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+								Timeout: 300,
+								State:   tinkerbell.WorkflowStatePending,
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	cases := map[string]struct {
+		workflow       *tinkerbell.Workflow
+		hardware       *tinkerbell.Hardware
+		request        *proto.ActionRequest
+		wantAnnotation bool
+		wantNoHWUpdate bool
+		wantInBand     bool
+		// wantReadHardwareCalls, when non-nil, asserts the exact number of ReadHardware
+		// calls - used to catch a redundant re-read when both the annotation and inBand
+		// paths resolve Hardware in the same request.
+		wantReadHardwareCalls *int
+	}{
+		"first action with HardwareRef and no existing annotation": {
+			workflow: baseWorkflow("my-hw"),
+			hardware: &tinkerbell.Hardware{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-hw",
+					Namespace: "default",
+				},
+				Spec: tinkerbell.HardwareSpec{AgentID: "machine-mac-1"},
+			},
+			request: &proto.ActionRequest{
+				AgentId:         toPtr("machine-mac-1"),
+				AgentAttributes: &proto.AgentAttributes{Cpu: &proto.CPU{TotalCores: toPtr(uint32(4))}},
+			},
+			wantAnnotation:        true,
+			wantInBand:            true,
+			wantReadHardwareCalls: toPtr(1),
+		},
+		"first action with nil attributes does not update hardware": {
+			workflow: baseWorkflow("my-hw"),
+			hardware: &tinkerbell.Hardware{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-hw",
+					Namespace: "default",
+				},
+				Spec: tinkerbell.HardwareSpec{AgentID: "machine-mac-1"},
+			},
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			wantNoHWUpdate: true,
+		},
+		"first action with HardwareRef and existing annotation still applies inBand": {
+			workflow: baseWorkflow("my-hw"),
+			hardware: &tinkerbell.Hardware{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-hw",
+					Namespace: "default",
+					Annotations: map[string]string{
+						constant.AttributesAnnotation: `{"cpu":{}}`,
+					},
+				},
+				Spec: tinkerbell.HardwareSpec{AgentID: "machine-mac-1"},
+			},
+			request: &proto.ActionRequest{
+				AgentId:         toPtr("machine-mac-1"),
+				AgentAttributes: &proto.AgentAttributes{Cpu: &proto.CPU{TotalCores: toPtr(uint32(4))}},
+			},
+			// The legacy annotation is write-once and stays untouched, but inBand is
+			// not gated on it: it must still be (re-)applied on every matching report.
+			wantNoHWUpdate:        true,
+			wantInBand:            true,
+			wantReadHardwareCalls: toPtr(1),
+		},
+		"first action with no HardwareRef": {
+			workflow: baseWorkflow(""),
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			wantNoHWUpdate: true,
+		},
+		"first action with HardwareRef but hardware not found": {
+			workflow: baseWorkflow("missing-hw"),
+			request: &proto.ActionRequest{
+				AgentId: toPtr("machine-mac-1"),
+			},
+			wantNoHWUpdate: true,
+		},
+		"first action but calling Agent is not the Hardware's own Agent": {
+			workflow: baseWorkflow("my-hw"),
+			hardware: &tinkerbell.Hardware{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-hw",
+					Namespace: "default",
+				},
+				// The Hardware's own Agent is a different (physical) Agent than the one
+				// serving this Workflow's first Task (e.g. an administrative Agent
+				// handling Netbox/network setup) - the annotation still gets written
+				// (unchanged legacy behavior), but inBand must not.
+				Spec: tinkerbell.HardwareSpec{AgentID: "some-other-physical-agent"},
+			},
+			request: &proto.ActionRequest{
+				AgentId:         toPtr("machine-mac-1"),
+				AgentAttributes: &proto.AgentAttributes{Cpu: &proto.CPU{TotalCores: toPtr(uint32(4))}},
+			},
+			wantAnnotation: true,
+			wantInBand:     false,
+		},
+		"non-first action does not update hardware": {
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Spec: tinkerbell.WorkflowSpec{
+					HardwareRef: "my-hw",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State: tinkerbell.WorkflowStateRunning,
+					CurrentState: &tinkerbell.CurrentState{
+						AgentID:  "machine-mac-1",
+						TaskID:   "provision",
+						ActionID: "stream",
+						State:    tinkerbell.WorkflowStateSuccess,
+					},
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "provision",
+							AgentID: "machine-mac-1",
+							ID:      "provision",
+							Actions: []tinkerbell.Action{
+								{
+									Name:  "stream",
+									Image: "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+									State: tinkerbell.WorkflowStateSuccess,
+									ID:    "stream",
+								},
+								{
+									Name:  "kexec",
+									Image: "quay.io/tinkerbell-actions/kexec:v1.0.0",
+									State: tinkerbell.WorkflowStatePending,
+									ID:    "kexec",
+								},
+							},
+						},
+					},
+				},
+			},
+			hardware: &tinkerbell.Hardware{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-hw",
+					Namespace: "default",
+				},
+				Spec: tinkerbell.HardwareSpec{AgentID: "machine-mac-1"},
+			},
+			request: &proto.ActionRequest{
+				AgentId:         toPtr("machine-mac-1"),
+				AgentAttributes: &proto.AgentAttributes{Cpu: &proto.CPU{TotalCores: toPtr(uint32(4))}},
+			},
+			wantNoHWUpdate: true,
+		},
+		"first action of a later Task on the Hardware's own Agent applies inBand even though the Workflow's first Task belongs to a different Agent": {
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Spec: tinkerbell.WorkflowSpec{
+					HardwareRef: "my-hw",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State: tinkerbell.WorkflowStateRunning,
+					Tasks: []tinkerbell.Task{
+						{
+							Name:    "provisioning network config",
+							AgentID: "admin-agent",
+							ID:      "task-admin",
+							Actions: []tinkerbell.Action{
+								{
+									Name:  "mark netbox provisioning",
+									Image: "curlimages/curl:8.11.1",
+									State: tinkerbell.WorkflowStateSuccess,
+									ID:    "action-admin",
+								},
+							},
+						},
+						{
+							Name:    "os installation",
+							AgentID: "machine-mac-1",
+							ID:      "task-os",
+							Actions: []tinkerbell.Action{
+								{
+									Name:  "select install target",
+									Image: "alpine:3.20",
+									State: tinkerbell.WorkflowStatePending,
+									ID:    "action-os",
+								},
+							},
+						},
+					},
+				},
+			},
+			hardware: &tinkerbell.Hardware{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-hw",
+					Namespace: "default",
+				},
+				Spec: tinkerbell.HardwareSpec{AgentID: "machine-mac-1"},
+			},
+			request: &proto.ActionRequest{
+				AgentId:         toPtr("machine-mac-1"),
+				AgentAttributes: &proto.AgentAttributes{Cpu: &proto.CPU{TotalCores: toPtr(uint32(4))}},
+			},
+			// This is not the Workflow's overall first Task, so the legacy annotation
+			// is not written - but it is the first Action of a Task assigned to the
+			// Hardware's own Agent, so inBand must still be applied.
+			wantNoHWUpdate: true,
+			wantInBand:     true,
+		},
+		"first action of a Task not assigned to the requesting Agent must not apply inBand": {
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine1",
+					Namespace: "default",
+				},
+				Spec: tinkerbell.WorkflowSpec{
+					HardwareRef: "my-hw",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					State: tinkerbell.WorkflowStateRunning,
+					Tasks: []tinkerbell.Task{
+						{
+							// Already successful, so the Task-selection loop skips
+							// straight to "provision" below - this keeps the case
+							// out of the isFirstAction(wf.Status.Tasks[0]) branch,
+							// which writes the legacy annotation unconditionally.
+							Name:    "prep",
+							AgentID: "machine-mac-1",
+							ID:      "prep",
+							Actions: []tinkerbell.Action{
+								{
+									Name:  "noop",
+									Image: "alpine:3.20",
+									State: tinkerbell.WorkflowStateSuccess,
+									ID:    "noop",
+								},
+							},
+						},
+						{
+							Name:    "provision",
+							AgentID: "other-agent",
+							ID:      "provision",
+							Actions: []tinkerbell.Action{
+								{
+									Name:  "stream",
+									Image: "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+									State: tinkerbell.WorkflowStatePending,
+									ID:    "stream",
+								},
+							},
+						},
+					},
+				},
+			},
+			hardware: &tinkerbell.Hardware{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-hw",
+					Namespace: "default",
+				},
+				// The requesting Agent owns the Hardware, but the "provision" Task
+				// is assigned to a different Agent - the Task-assignment check
+				// (not the Hardware-ownership check inside resolveAndApplyInBandAttributes)
+				// is what must gate the write here.
+				Spec: tinkerbell.HardwareSpec{AgentID: "machine-mac-1"},
+			},
+			request: &proto.ActionRequest{
+				AgentId:         toPtr("machine-mac-1"),
+				AgentAttributes: &proto.AgentAttributes{Cpu: &proto.CPU{TotalCores: toPtr(uint32(4))}},
+			},
+			wantNoHWUpdate: true,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			mock := &mockBackendReadWriter{
+				workflow: tc.workflow,
+				hardware: tc.hardware,
+			}
+			server := &Handler{
+				Logger:  logr.FromSlogHandler(slog.NewJSONHandler(os.Stdout, nil)),
+				Backend: mock,
+				NowFunc: func() time.Time { return time.Time{} },
+			}
+
+			_, _ = server.GetAction(context.Background(), tc.request)
+
+			if tc.wantAnnotation {
+				if mock.updatedHardware == nil {
+					t.Fatal("expected Hardware to be updated with attributes annotation, but UpdateHardware was not called")
+				}
+				if mock.updatedHardware.Annotations[constant.AttributesAnnotation] == "" {
+					t.Fatal("expected attributes annotation to be set, but it was empty")
+				}
+				if mock.updateOpts.PatchFrom == nil {
+					t.Fatal("expected PatchFrom to be set in UpdateOptions for merge-patch, but it was nil")
+				}
+			}
+			if tc.wantNoHWUpdate {
+				if mock.updatedHardware != nil {
+					t.Fatalf("expected no Hardware update, but UpdateHardware was called with %v", mock.updatedHardware.Name)
+				}
+			}
+			if tc.wantInBand {
+				if mock.appliedInBand == nil {
+					t.Fatal("expected status.attributes.inBand to be applied, but ApplyHardwareInBandAttributes was not called")
+				}
+				if mock.appliedInBand.CollectionMethod != "agent" {
+					t.Errorf("appliedInBand.CollectionMethod = %q, want agent", mock.appliedInBand.CollectionMethod)
+				}
+				if mock.appliedInBand.LastUpdated == nil {
+					t.Error("appliedInBand.LastUpdated is nil, want it set")
+				}
+				if mock.appliedInBand.CPU == nil || mock.appliedInBand.CPU.TotalCores != 4 {
+					t.Errorf("appliedInBand.CPU = %+v, want TotalCores=4", mock.appliedInBand.CPU)
+				}
+			} else if mock.appliedInBand != nil {
+				t.Errorf("expected status.attributes.inBand not to be applied, but it was: %+v", mock.appliedInBand)
+			}
+			if tc.wantReadHardwareCalls != nil && mock.readHardwareCalls != *tc.wantReadHardwareCalls {
+				t.Errorf("ReadHardware called %d times, want %d", mock.readHardwareCalls, *tc.wantReadHardwareCalls)
+			}
+		})
+	}
+}
+
+func TestReportActionStatus(t *testing.T) {
+	tests := map[string]struct {
+		request      *proto.ActionStatusRequest
+		workflow     *tinkerbell.Workflow
+		writeErr     error
+		expectedResp *proto.ActionStatusResponse
+		expectedErr  error
+	}{
+		"success": {
+			request: &proto.ActionStatusRequest{
+				WorkflowId:        toPtr("default/workflow1"),
+				TaskId:            toPtr("task1"),
+				ActionId:          toPtr("action1"),
+				ActionState:       toPtr(proto.ActionStatusRequest_SUCCESS),
+				ExecutionStart:    timestamppb.New(time.Now()),
+				ExecutionDuration: toPtr("30s"),
+				Message: &proto.ActionMessage{
+					Message: toPtr("Action completed successfully"),
+				},
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workflow1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					Tasks: []tinkerbell.Task{
+						{
+							ID: "task1",
+							Actions: []tinkerbell.Action{
+								{
+									ID:    "action1",
+									State: tinkerbell.WorkflowStatePending,
+								},
+							},
+						},
+					},
+				},
+			},
+			writeErr:     nil,
+			expectedErr:  nil,
+			expectedResp: &proto.ActionStatusResponse{},
+		},
+		"write error": {
+			request: &proto.ActionStatusRequest{
+				WorkflowId:        toPtr("default/workflow6"),
+				TaskId:            toPtr("task1"),
+				ActionId:          toPtr("action1"),
+				ActionState:       toPtr(proto.ActionStatusRequest_SUCCESS),
+				ExecutionStart:    timestamppb.New(time.Now()),
+				ExecutionDuration: toPtr("30s"),
+				Message: &proto.ActionMessage{
+					Message: toPtr("Action completed successfully"),
+				},
+			},
+			workflow: &tinkerbell.Workflow{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workflow1",
+					Namespace: "default",
+				},
+				Status: tinkerbell.WorkflowStatus{
+					Tasks: []tinkerbell.Task{
+						{
+							ID: "task1",
+							Actions: []tinkerbell.Action{
+								{
+									ID:    "action1",
+									State: tinkerbell.WorkflowStatePending,
+								},
+							},
+						},
+					},
+				},
+			},
+			writeErr:    errors.New("write error"),
+			expectedErr: status.Errorf(codes.Internal, "error writing report status: write error"),
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			handler := &Handler{
+				Backend: &mockBackendReadWriter{
+					workflow: tc.workflow,
+					writeErr: tc.writeErr,
+				},
+			}
+
+			resp, err := handler.ReportActionStatus(context.Background(), tc.request)
+
+			if diff := cmp.Diff(tc.expectedResp, resp, protocmp.Transform()); diff != "" {
+				t.Errorf("unexpected response (-want +got):\n%s", diff)
+			}
+
+			if tc.expectedErr != nil {
+				if err == nil || err.Error() != tc.expectedErr.Error() {
+					t.Errorf("unexpected error: \ngot:  %v\nwant: %v", err, tc.expectedErr)
+				}
+			} else if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestTerminalWorkflowFence(t *testing.T) {
+	terminalWorkflowStates := []tinkerbell.WorkflowState{
+		tinkerbell.WorkflowStatePost,
+		tinkerbell.WorkflowStateSuccess,
+		tinkerbell.WorkflowStateFailed,
+		tinkerbell.WorkflowStateTimeout,
+	}
+	for _, workflowState := range terminalWorkflowStates {
+		t.Run("GetAction "+string(workflowState)+" is rejected without a status write", func(t *testing.T) {
+			workflow := failedWorkflowFixture()
+			workflow.Status.State = workflowState
+			before := workflow.DeepCopy()
+			backend := &mockBackendReadWriter{workflow: workflow}
+			handler := &Handler{
+				Logger:  logr.Discard(),
+				Backend: backend,
+			}
+
+			resp, err := handler.GetAction(context.Background(), &proto.ActionRequest{AgentId: toPtr("agent-1")})
+			if status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.FailedPrecondition, err)
+			}
+			if resp != nil {
+				t.Fatalf("expected no action, got %+v", resp)
+			}
+			if backend.workflowLists != 1 {
+				t.Fatalf("expected one workflow list, got %d", backend.workflowLists)
+			}
+			if backend.workflowUpdates != 0 {
+				t.Fatalf("expected zero workflow updates, got %d", backend.workflowUpdates)
+			}
+			if diff := cmp.Diff(before, backend.workflow); diff != "" {
+				t.Fatalf("terminal workflow changed (-want +got):\n%s", diff)
+			}
+		})
+	}
+
+	for _, workflowState := range terminalWorkflowStates {
+		t.Run("ReportActionStatus "+string(workflowState), func(t *testing.T) {
+			testTerminalWorkflowReports(t, workflowState)
+		})
+	}
+
+	unknownAction := actionStatusRequest(proto.ActionStatusRequest_SUCCESS)
+	unknownAction.ActionId = toPtr("unknown-action")
+	wrongAgent := actionStatusRequest(proto.ActionStatusRequest_SUCCESS)
+	wrongAgent.AgentId = toPtr("wrong-agent")
+	for _, tc := range []struct {
+		name    string
+		request *proto.ActionStatusRequest
+	}{
+		{name: "unknown action returns NotFound", request: unknownAction},
+		{name: "wrong agent returns NotFound", request: wrongAgent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workflow := failedWorkflowFixture()
+			before := workflow.DeepCopy()
+			backend := &mockBackendReadWriter{workflow: workflow}
+			handler := &Handler{
+				Backend: backend,
+			}
+
+			resp, err := handler.ReportActionStatus(context.Background(), tc.request)
+			if status.Code(err) != codes.NotFound {
+				t.Fatalf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.NotFound, err)
+			}
+			if resp != nil {
+				t.Fatalf("expected no response, got %+v", resp)
+			}
+			if backend.workflowReads != 1 {
+				t.Fatalf("expected one workflow read, got %d", backend.workflowReads)
+			}
+			if backend.workflowUpdates != 0 {
+				t.Fatalf("expected zero workflow updates, got %d", backend.workflowUpdates)
+			}
+			if diff := cmp.Diff(before, backend.workflow); diff != "" {
+				t.Fatalf("failed workflow changed (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func testTerminalWorkflowReports(t *testing.T, workflowState tinkerbell.WorkflowState) {
+	t.Helper()
+
+	for _, actionState := range []proto.ActionStatusRequest_StateType{
+		proto.ActionStatusRequest_RUNNING,
+		proto.ActionStatusRequest_SUCCESS,
+		proto.ActionStatusRequest_FAILED,
+		proto.ActionStatusRequest_TIMEOUT,
+	} {
+		t.Run(actionState.String(), func(t *testing.T) {
+			workflow := failedWorkflowFixture()
+			workflow.Status.State = workflowState
+			before := workflow.DeepCopy()
+			backend := &mockBackendReadWriter{workflow: workflow}
+			handler := &Handler{
+				Backend: backend,
+			}
+
+			resp, err := handler.ReportActionStatus(context.Background(), actionStatusRequest(actionState))
+			if actionState == proto.ActionStatusRequest_RUNNING {
+				if status.Code(err) != codes.FailedPrecondition {
+					t.Fatalf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.FailedPrecondition, err)
+				}
+				if resp != nil {
+					t.Fatalf("expected no response, got %+v", resp)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("completion report returned an error: %v", err)
+				}
+				if resp == nil {
+					t.Fatal("expected completion report to be acknowledged")
+				}
+			}
+			if backend.workflowReads != 1 {
+				t.Fatalf("expected one workflow read, got %d", backend.workflowReads)
+			}
+			if backend.workflowUpdates != 0 {
+				t.Fatalf("expected zero workflow updates, got %d", backend.workflowUpdates)
+			}
+			if diff := cmp.Diff(before, backend.workflow); diff != "" {
+				t.Fatalf("terminal workflow changed (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestTerminalWorkflowFenceWinsUpdateConflict(t *testing.T) {
+	t.Run("GetAction retry cannot replace cancellation", func(t *testing.T) {
+		workflow := failedWorkflowFixture()
+		workflow.Status.State = tinkerbell.WorkflowStateRunning
+		workflow.Status.CurrentState = nil
+		workflow.Status.Tasks[0].Actions[0].State = tinkerbell.WorkflowStatePending
+
+		cancelled := workflow.DeepCopy()
+		cancelled.Status.State = tinkerbell.WorkflowStateFailed
+		cancelled.Annotations["tinkerbell.org/cancellation"] = "committed"
+
+		backend := &mockBackendReadWriter{workflow: workflow.DeepCopy()}
+		backend.listWorkflowsFunc = func() ([]tinkerbell.Workflow, error) {
+			return []tinkerbell.Workflow{*backend.workflow.DeepCopy()}, nil
+		}
+		backend.updateWorkflowFunc = func(_ *tinkerbell.Workflow) error {
+			backend.workflow = cancelled.DeepCopy()
+			return kerrors.NewConflict(schema.GroupResource{Group: "tinkerbell.org", Resource: "workflows"}, workflow.Name, errors.New("cancellation won"))
+		}
+		handler := &Handler{
+			Logger:  logr.Discard(),
+			Backend: backend,
+		}
+
+		// The conflict is returned as Aborted so the Agent retries soon.
+		_, err := handler.GetAction(context.Background(), &proto.ActionRequest{AgentId: toPtr("agent-1")})
+		if status.Code(err) != codes.Aborted {
+			t.Fatalf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.Aborted, err)
+		}
+		if backend.workflowLists != 1 {
+			t.Fatalf("expected a single attempt, got %d workflow lists", backend.workflowLists)
+		}
+
+		// The Agent's retry reads the cancellation.
+		_, err = handler.GetAction(context.Background(), &proto.ActionRequest{AgentId: toPtr("agent-1")})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.FailedPrecondition, err)
+		}
+		if backend.workflowLists != 2 {
+			t.Fatalf("expected retry to read cancellation, got %d workflow lists", backend.workflowLists)
+		}
+		if backend.workflowUpdates != 1 {
+			t.Fatalf("expected no update after cancellation was read, got %d updates", backend.workflowUpdates)
+		}
+		if diff := cmp.Diff(cancelled, backend.workflow); diff != "" {
+			t.Fatalf("committed cancellation changed (-want +got):\n%s", diff)
+		}
+	})
+
+	for _, workflowState := range []tinkerbell.WorkflowState{
+		tinkerbell.WorkflowStatePost,
+		tinkerbell.WorkflowStateSuccess,
+		tinkerbell.WorkflowStateFailed,
+		tinkerbell.WorkflowStateTimeout,
+	} {
+		t.Run("completion retry is acknowledged and discarded after "+string(workflowState), func(t *testing.T) {
+			testCompletionRetryAfterTerminalWorkflowUpdateConflict(t, workflowState)
+		})
+	}
+}
+
+func testCompletionRetryAfterTerminalWorkflowUpdateConflict(t *testing.T, workflowState tinkerbell.WorkflowState) {
+	t.Helper()
+
+	workflow := failedWorkflowFixture()
+	workflow.Status.State = tinkerbell.WorkflowStateRunning
+
+	committed := workflow.DeepCopy()
+	committed.Status.State = workflowState
+	committed.Annotations["tinkerbell.org/terminal-state"] = "committed"
+
+	backend := &mockBackendReadWriter{workflow: workflow.DeepCopy()}
+	backend.readWorkflowFunc = func() (*tinkerbell.Workflow, error) {
+		return backend.workflow.DeepCopy(), nil
+	}
+	backend.updateWorkflowFunc = func(_ *tinkerbell.Workflow) error {
+		backend.workflow = committed.DeepCopy()
+		return kerrors.NewConflict(schema.GroupResource{Group: "tinkerbell.org", Resource: "workflows"}, workflow.Name, errors.New("terminal state won"))
+	}
+	handler := &Handler{
+		Backend: backend,
+	}
+
+	// The conflict is returned as Aborted so the Agent retries soon.
+	_, err := handler.ReportActionStatus(context.Background(), actionStatusRequest(proto.ActionStatusRequest_SUCCESS))
+	if status.Code(err) != codes.Aborted {
+		t.Fatalf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.Aborted, err)
+	}
+	if backend.workflowReads != 1 {
+		t.Fatalf("expected a single attempt, got %d workflow reads", backend.workflowReads)
+	}
+
+	// The Agent's retry reads the terminal Workflow and is acknowledged.
+	resp, err := handler.ReportActionStatus(context.Background(), actionStatusRequest(proto.ActionStatusRequest_SUCCESS))
+	if err != nil {
+		t.Fatalf("completion report returned an error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected completion report to be acknowledged")
+	}
+	if backend.workflowReads != 2 {
+		t.Fatalf("expected retry to read terminal workflow, got %d workflow reads", backend.workflowReads)
+	}
+	if backend.workflowUpdates != 1 {
+		t.Fatalf("expected no update after terminal workflow was read, got %d updates", backend.workflowUpdates)
+	}
+	if diff := cmp.Diff(committed, backend.workflow); diff != "" {
+		t.Fatalf("committed terminal workflow changed (-want +got):\n%s", diff)
+	}
+}
+
+func failedWorkflowFixture() *tinkerbell.Workflow {
+	executionStart := metav1.NewTime(time.Unix(1_700_000_000, 0).UTC())
+	return &tinkerbell.Workflow{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "workflow-1",
+			Namespace:       "default",
+			ResourceVersion: "7",
+			Annotations: map[string]string{
+				"tinkerbell.org/internal": "preserve-me",
+			},
+		},
+		Status: tinkerbell.WorkflowStatus{
+			AgentID:       "agent-1",
+			State:         tinkerbell.WorkflowStateFailed,
+			GlobalTimeout: 600,
+			CurrentState: &tinkerbell.CurrentState{
+				AgentID:    "agent-1",
+				TaskID:     "task-1",
+				ActionID:   "action-1",
+				State:      tinkerbell.WorkflowStateRunning,
+				ActionName: "install",
+				TaskName:   "provision",
+			},
+			Tasks: []tinkerbell.Task{
+				{
+					ID:      "task-1",
+					Name:    "provision",
+					AgentID: "agent-1",
+					Actions: []tinkerbell.Action{
+						{
+							ID:                "action-1",
+							Name:              "install",
+							Image:             "example/install:latest",
+							State:             tinkerbell.WorkflowStateRunning,
+							ExecutionStart:    &executionStart,
+							ExecutionDuration: "10s",
+							Message:           "still running when cancelled",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func actionStatusRequest(actionState proto.ActionStatusRequest_StateType) *proto.ActionStatusRequest {
+	return &proto.ActionStatusRequest{
+		WorkflowId:        toPtr("default/workflow-1"),
+		AgentId:           toPtr("agent-1"),
+		TaskId:            toPtr("task-1"),
+		ActionId:          toPtr("action-1"),
+		ActionName:        toPtr("install"),
+		ActionState:       toPtr(actionState),
+		ExecutionStart:    timestamppb.New(time.Unix(1_700_000_000, 0).UTC()),
+		ExecutionStop:     timestamppb.New(time.Unix(1_700_000_030, 0).UTC()),
+		ExecutionDuration: toPtr("30s"),
+		Message:           &proto.ActionMessage{Message: toPtr("late report")},
+	}
+}
+
+// terminalWorkflowFixture returns a completed Workflow that still carries the
+// agent's ID, so it remains in the agent-ID index alongside newer Workflows.
+func terminalWorkflowFixture(name string) tinkerbell.Workflow {
+	return tinkerbell.Workflow{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Status: tinkerbell.WorkflowStatus{
+			AgentID: "machine-mac-1",
+			State:   tinkerbell.WorkflowStateSuccess,
+			Tasks: []tinkerbell.Task{
+				{
+					Name:    "provision",
+					AgentID: "machine-mac-1",
+					ID:      "provision",
+					Actions: []tinkerbell.Action{{
+						Name:  "stream",
+						Image: "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+						State: tinkerbell.WorkflowStateSuccess,
+						ID:    "stream",
+					}},
+				},
+			},
+		},
+	}
+}
+
+// activeWorkflowFixture returns a running Workflow whose first Action is servable.
+func activeWorkflowFixture(name string) tinkerbell.Workflow {
+	return tinkerbell.Workflow{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Status: tinkerbell.WorkflowStatus{
+			AgentID:       "machine-mac-1",
+			State:         tinkerbell.WorkflowStateRunning,
+			GlobalTimeout: 600,
+			Tasks: []tinkerbell.Task{
+				{
+					Name:    "provision",
+					AgentID: "machine-mac-1",
+					Actions: []tinkerbell.Action{{
+						Name:    "stream",
+						Image:   "quay.io/tinkerbell-actions/image2disk:v1.0.0",
+						Timeout: 300,
+						State:   tinkerbell.WorkflowStatePending,
+					}},
+				},
+			},
+		},
+	}
+}
+
+// TestGetActionTerminalDoesNotShadowActive verifies that a terminal Workflow
+// left in the agent-ID index does not prevent a co-listed pending/running
+// Workflow for the same agent from being served, regardless of list order.
+func TestGetActionTerminalDoesNotShadowActive(t *testing.T) {
+	t.Run("terminal listed before active still serves active", func(t *testing.T) {
+		backend := &mockBackendReadWriter{}
+		backend.listWorkflowsFunc = func() ([]tinkerbell.Workflow, error) {
+			return []tinkerbell.Workflow{terminalWorkflowFixture("machine0"), activeWorkflowFixture("machine1")}, nil
+		}
+		handler := &Handler{
+			Logger:  logr.Discard(),
+			Backend: backend,
+			NowFunc: func() time.Time { return time.Time{} },
+		}
+
+		resp, err := handler.GetAction(context.Background(), &proto.ActionRequest{AgentId: toPtr("machine-mac-1")})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.GetName() != "stream" || resp.GetWorkflowId() != "default/machine1" {
+			t.Fatalf("expected active Workflow's action to be served, got workflow %q action %q", resp.GetWorkflowId(), resp.GetName())
+		}
+	})
+
+	t.Run("active listed before terminal still serves active", func(t *testing.T) {
+		backend := &mockBackendReadWriter{}
+		backend.listWorkflowsFunc = func() ([]tinkerbell.Workflow, error) {
+			return []tinkerbell.Workflow{activeWorkflowFixture("machine1"), terminalWorkflowFixture("machine0")}, nil
+		}
+		handler := &Handler{
+			Logger:  logr.Discard(),
+			Backend: backend,
+			NowFunc: func() time.Time { return time.Time{} },
+		}
+
+		resp, err := handler.GetAction(context.Background(), &proto.ActionRequest{AgentId: toPtr("machine-mac-1")})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.GetName() != "stream" || resp.GetWorkflowId() != "default/machine1" {
+			t.Fatalf("expected active Workflow's action to be served, got workflow %q action %q", resp.GetWorkflowId(), resp.GetName())
+		}
+	})
+
+	t.Run("all terminal returns FailedPrecondition after one list", func(t *testing.T) {
+		backend := &mockBackendReadWriter{}
+		backend.listWorkflowsFunc = func() ([]tinkerbell.Workflow, error) {
+			return []tinkerbell.Workflow{terminalWorkflowFixture("machine0"), terminalWorkflowFixture("machine2")}, nil
+		}
+		handler := &Handler{
+			Logger:  logr.Discard(),
+			Backend: backend,
+			NowFunc: func() time.Time { return time.Time{} },
+		}
+
+		_, err := handler.GetAction(context.Background(), &proto.ActionRequest{AgentId: toPtr("machine-mac-1")})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.FailedPrecondition, err)
+		}
+		if backend.workflowLists != 1 {
+			t.Fatalf("expected one list, got %d lists", backend.workflowLists)
+		}
+	})
+}
+
+// TestGetActionSingleAttempt verifies the server does not retry: an idle Agent's
+// request costs one Workflow list and returns immediately. The Agent owns retries.
+func TestGetActionSingleAttempt(t *testing.T) {
+	backend := &countingLister{}
+	handler := &Handler{Logger: logr.Discard(), Backend: backend}
+
+	const agents = 8
+	var wg sync.WaitGroup
+	for range agents {
+		wg.Go(func() {
+			_, err := handler.GetAction(context.Background(), &proto.ActionRequest{AgentId: toPtr("agent-1")})
+			if status.Code(err) != codes.NotFound {
+				t.Errorf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.NotFound, err)
+			}
+		})
+	}
+	wg.Wait()
+	if got := backend.lists.Load(); got != agents {
+		t.Fatalf("expected one workflow list per request, got %d lists for %d requests", got, agents)
+	}
+}
+
+// countingLister is safe for concurrent use and always lists no Workflows.
+type countingLister struct {
+	mockBackendReadWriter
+	lists atomic.Int32
+}
+
+func (c *countingLister) ListWorkflows(context.Context, data.WorkflowFilter) ([]tinkerbell.Workflow, error) {
+	c.lists.Add(1)
+	return nil, nil
+}
+
+// TestReportActionStatusDeletedWorkflow verifies a report for a deleted Workflow is
+// NotFound, which the Agent treats as permanent, rather than retryable Internal.
+func TestReportActionStatusDeletedWorkflow(t *testing.T) {
+	backend := &mockBackendReadWriter{
+		readWorkflowFunc: func() (*tinkerbell.Workflow, error) {
+			return nil, kerrors.NewNotFound(schema.GroupResource{Group: "tinkerbell.org", Resource: "workflows"}, "workflow-1")
+		},
+	}
+	handler := &Handler{Backend: backend}
+
+	_, err := handler.ReportActionStatus(context.Background(), actionStatusRequest(proto.ActionStatusRequest_SUCCESS))
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.NotFound, err)
+	}
+}
+
+func TestReportActionStatusInvalidWorkflowID(t *testing.T) {
+	for name, id := range map[string]string{
+		"empty":        "",
+		"no separator": "workflow-1",
+		"no namespace": "/workflow-1",
+		"no name":      "default/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			backend := &mockBackendReadWriter{workflow: failedWorkflowFixture()}
+			handler := &Handler{Backend: backend}
+			req := actionStatusRequest(proto.ActionStatusRequest_SUCCESS)
+			req.WorkflowId = toPtr(id)
+
+			_, err := handler.ReportActionStatus(context.Background(), req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("unexpected error code: got %s, want %s (error: %v)", status.Code(err), codes.InvalidArgument, err)
+			}
+			if backend.workflowReads != 0 {
+				t.Fatalf("expected no workflow read, got %d", backend.workflowReads)
+			}
+		})
+	}
+}

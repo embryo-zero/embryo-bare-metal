@@ -1,0 +1,40 @@
+merge_queue:
+  max_parallel_checks: 1
+queue_rules:
+  - name: default
+    batch_size: 1
+    queue_conditions:
+      - -draft
+      - base=main
+      - or:
+          - "#approved-reviews-by>=1"
+          - author=jacobweinstock
+      - "#changes-requested-reviews-by=0"
+      - check-success=DCO
+      - check-success=validation
+      - check-success=build / tink-agent
+      - check-success=build / tinkerbell
+      - label!=do-not-merge
+      - label=ready-to-merge
+    merge_conditions:
+      # Conditions to get out of the queue (= merged)
+      - base=main
+      - or:
+          - "#approved-reviews-by>=1"
+          - author=jacobweinstock
+      - "#changes-requested-reviews-by=0"
+      - check-success=DCO
+      - check-success=validation
+      - check-success=build / tink-agent
+      - check-success=build / tinkerbell
+      - label!=do-not-merge
+      - label=ready-to-merge
+      # This extra condition forces draft PR mode (prevents in-place checks)
+      - queue-position>=0
+    merge_method: merge
+    commit_message_format:
+      title: pr-title
+      body: pr-body
+merge_protections_settings:
+  reporting_method: check-runs
+  auto_merge_conditions: true

@@ -1,0 +1,62 @@
+package flag
+
+import (
+	"github.com/peterbourgon/ff/v4/ffval"
+	"github.com/tinkerbell/tinkerbell/rufio"
+)
+
+type RufioConfig struct {
+	Config   *rufio.Config
+	LogLevel int
+}
+
+func RegisterRufioFlags(fs *Set, t *RufioConfig) {
+	fs.Register(RufioControllerEnableLeaderElection, ffval.NewValueDefault(&t.Config.EnableLeaderElection, t.Config.EnableLeaderElection))
+	fs.Register(RufioControllerLeaderElectionNamespace, ffval.NewValueDefault(&t.Config.LeaderElectionNamespace, t.Config.LeaderElectionNamespace))
+	fs.Register(RufioBMCConnectTimeout, ffval.NewValueDefault(&t.Config.BMCConnectTimeout, t.Config.BMCConnectTimeout))
+	fs.Register(RufioPowerCheckInterval, ffval.NewValueDefault(&t.Config.PowerCheckInterval, t.Config.PowerCheckInterval))
+	fs.Register(RufioInventoryRefreshInterval, ffval.NewValueDefault(&t.Config.InventoryRefreshInterval, t.Config.InventoryRefreshInterval))
+	fs.Register(RufioEnableInventoryCollection, ffval.NewValueDefault(&t.Config.EnableInventoryCollection, t.Config.EnableInventoryCollection))
+	fs.Register(RufioMaxConcurrentReconciles, ffval.NewValueDefault(&t.Config.MaxConcurrentReconciles, t.Config.MaxConcurrentReconciles))
+	fs.Register(RufioLogLevel, ffval.NewValueDefault(&t.LogLevel, t.LogLevel))
+}
+
+var RufioControllerEnableLeaderElection = Config{
+	Name:  "rufio-controller-enable-leader-election",
+	Usage: "enable leader election for controller manager",
+}
+
+var RufioControllerLeaderElectionNamespace = Config{
+	Name:  "rufio-controller-leader-election-namespace",
+	Usage: "namespace in which the leader election lease will be created; empty means the backend namespace when that is set",
+}
+
+var RufioBMCConnectTimeout = Config{
+	Name:  "rufio-bmc-connect-timeout",
+	Usage: "timeout for BMC connection",
+}
+
+var RufioPowerCheckInterval = Config{
+	Name:  "rufio-power-check-interval",
+	Usage: "interval at which the machine's power state is reconciled",
+}
+
+var RufioInventoryRefreshInterval = Config{
+	Name:  "rufio-inventory-refresh-interval",
+	Usage: "interval at which out-of-band BMC hardware inventory is refreshed",
+}
+
+var RufioEnableInventoryCollection = Config{
+	Name:  "rufio-enable-inventory-collection",
+	Usage: "enable out-of-band BMC hardware inventory collection; individual Hardware objects can additionally opt out via the tinkerbell.org/disable-outofband-inventory annotation",
+}
+
+var RufioLogLevel = Config{
+	Name:  "rufio-log-level",
+	Usage: logLevelUsage,
+}
+
+var RufioMaxConcurrentReconciles = Config{
+	Name:  "rufio-max-concurrent-reconciles",
+	Usage: "maximum number of concurrent reconciles for rufio controllers",
+}

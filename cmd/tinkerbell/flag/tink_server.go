@@ -1,0 +1,95 @@
+package flag
+
+import (
+	"net/netip"
+
+	"github.com/peterbourgon/ff/v4/ffval"
+	"github.com/tinkerbell/tinkerbell/pkg/backend/kube"
+	ntip "github.com/tinkerbell/tinkerbell/pkg/flag/netip"
+	"github.com/tinkerbell/tinkerbell/tink/server"
+)
+
+type TinkServerConfig struct {
+	Config     *server.Config
+	BindAddr   netip.Addr
+	BindAddrV6 netip.Addr
+	BindPort   uint16
+	BindPortV6 uint16
+	LogLevel   int
+}
+
+var KubeIndexesTinkServer = map[kube.IndexType]kube.Index{
+	kube.IndexTypeWorkflowAgentID: kube.Indexes[kube.IndexTypeWorkflowAgentID],
+	kube.IndexTypeHardwareAgentID: kube.Indexes[kube.IndexTypeHardwareAgentID],
+}
+
+func RegisterTinkServerFlags(fs *Set, t *TinkServerConfig) {
+	fs.RegisterFamily(TinkServerBindAddr, V4, &ntip.Addr{Addr: &t.BindAddr})
+	fs.RegisterFamily(TinkServerBindAddr, V6, &ntip.Addr{Addr: &t.BindAddrV6})
+	fs.RegisterFamily(TinkServerBindPort, V4, ffval.NewValueDefault(&t.BindPort, t.BindPort))
+	fs.RegisterFamily(TinkServerBindPort, V6, ffval.NewValueDefault(&t.BindPortV6, t.BindPortV6))
+	fs.Register(TinkServerLogLevel, ffval.NewValueDefault(&t.LogLevel, t.LogLevel))
+	fs.Register(TinkServerAutoEnrollmentEnabled, ffval.NewValueDefault(&t.Config.Auto.Enrollment.Enabled, t.Config.Auto.Enrollment.Enabled))
+	fs.Register(TinkerbellAutoDiscoveryEnabled, ffval.NewValueDefault(&t.Config.Auto.Discovery.Enabled, t.Config.Auto.Discovery.Enabled))
+	fs.Register(TinkerbellAutoDiscoveryAutoEnrollmentEnabled, ffval.NewValueDefault(&t.Config.Auto.Discovery.EnrollmentEnabled, t.Config.Auto.Discovery.EnrollmentEnabled))
+	fs.Register(TinkerbellAutoDiscoveryNamespace, ffval.NewValueDefault(&t.Config.Auto.Discovery.Namespace, t.Config.Auto.Discovery.Namespace))
+}
+
+// Convert TinkServerConfig data types to tink server server.Config data types.
+// A family with no service-specific address falls back to the global one.
+// Whether a family is served is resolved separately, so only addresses are set
+// here.
+func (t *TinkServerConfig) Convert(bindAddr, bindAddrV6 netip.Addr) {
+	addr := bindAddr
+	if t.BindAddr.IsValid() {
+		addr = t.BindAddr
+	}
+	if addr.IsValid() {
+		t.Config.V4.Addr = addr
+		t.Config.V4.Port = t.BindPort
+	}
+
+	addrV6 := bindAddrV6
+	if t.BindAddrV6.IsValid() {
+		addrV6 = t.BindAddrV6
+	}
+	if addrV6.IsValid() {
+		t.Config.V6.Addr = addrV6
+		t.Config.V6.Port = t.BindPortV6
+	}
+}
+
+var TinkServerBindAddr = Config{
+	Name:  "tink-server-bind-addr",
+	Usage: "ip address on which the Tink server will listen",
+}
+
+var TinkServerBindPort = Config{
+	Name:  "tink-server-bind-port",
+	Usage: "port on which the Tink server will listen",
+}
+
+var TinkServerLogLevel = Config{
+	Name:  "tink-server-log-level",
+	Usage: logLevelUsage,
+}
+
+var TinkServerAutoEnrollmentEnabled = Config{
+	Name:  "tink-server-auto-enrollment-enabled",
+	Usage: "enable auto enrollment capabilities for the Tink server",
+}
+
+var TinkerbellAutoDiscoveryEnabled = Config{
+	Name:  "tink-server-auto-discovery-enabled",
+	Usage: "enable auto discovery capabilities for the Tink server",
+}
+
+var TinkerbellAutoDiscoveryNamespace = Config{
+	Name:  "tink-server-auto-discovery-namespace",
+	Usage: "namespace in which the Tink server will create auto discovered Hardware objects; defaults to the backend namespace when that is set",
+}
+
+var TinkerbellAutoDiscoveryAutoEnrollmentEnabled = Config{
+	Name:  "tink-server-auto-discovery-auto-enrollment-enabled",
+	Usage: "this tells auto discovery the value to set for the hardware.spec.auto.enrollmentEnabled field when creating Hardware objects",
+}

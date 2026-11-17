@@ -1,0 +1,135 @@
+/*
+Copyright 2022 Tinkerbell.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package rufio
+
+import (
+	"context"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/tinkerbell/tinkerbell/rufio/internal/controller"
+	"k8s.io/client-go/rest"
+	controllerruntime "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
+)
+
+type Config struct {
+	// Namespaces are the namespaces to watch. Empty means all namespaces.
+	Namespaces                []string
+	Client                    *rest.Config
+	EnableLeaderElection      bool
+	LeaderElectionNamespace   string
+	BMCConnectTimeout         time.Duration
+	PowerCheckInterval        time.Duration
+	InventoryRefreshInterval  time.Duration
+	EnableInventoryCollection bool
+	MaxConcurrentReconciles   int
+}
+
+type Option func(*Config)
+
+func WithNamespaces(namespaces ...string) Option {
+	return func(c *Config) {
+		c.Namespaces = namespaces
+	}
+}
+
+func WithClient(client *rest.Config) Option {
+	return func(c *Config) {
+		c.Client = client
+	}
+}
+
+func WithEnableLeaderElection(enableLeaderElection bool) Option {
+	return func(c *Config) {
+		c.EnableLeaderElection = enableLeaderElection
+	}
+}
+
+func WithBmcConnectTimeout(timeout time.Duration) Option {
+	return func(c *Config) {
+		c.BMCConnectTimeout = timeout
+	}
+}
+
+func WithPowerCheckInterval(interval time.Duration) Option {
+	return func(c *Config) {
+		c.PowerCheckInterval = interval
+	}
+}
+
+func WithInventoryRefreshInterval(interval time.Duration) Option {
+	return func(c *Config) {
+		c.InventoryRefreshInterval = interval
+	}
+}
+
+// WithEnableInventoryCollection is a fleet-wide kill switch for BMC (out-of-band)
+// inventory collection. Individual Hardware objects can additionally opt out via
+// the tinkerbell.org/disable-outofband-inventory annotation.
+func WithEnableInventoryCollection(enable bool) Option {
+	return func(c *Config) {
+		c.EnableInventoryCollection = enable
+	}
+}
+
+func WithLeaderElectionNamespace(namespace string) Option {
+	return func(c *Config) {
+		c.LeaderElectionNamespace = namespace
+	}
+}
+
+func NewConfig(opts ...Option) *Config {
+	defaults := &Config{
+		EnableLeaderElection:      true,
+		EnableInventoryCollection: true,
+		MaxConcurrentReconciles:   1,
+	}
+
+	for _, opt := range opts {
+		opt(defaults)
+	}
+
+	return defaults
+}
+
+func (c *Config) Start(ctx context.Context, log logr.Logger) error {
+	options := controllerruntime.Options{
+		Logger:                  log,
+		LeaderElection:          c.EnableLeaderElection,
+		LeaderElectionID:        "e74dec1a.bmc.tinkerbell.org",
+		LeaderElectionNamespace: c.LeaderElectionNamespace,
+		Metrics: server.Options{
+			BindAddress: "0",
+		},
+		HealthProbeBindAddress: "0",
+	}
+	if len(c.Namespaces) > 0 {
+		options.Cache = cache.Options{DefaultNamespaces: make(map[string]cache.Config, len(c.Namespaces))}
+		for _, ns := range c.Namespaces {
+			options.Cache.DefaultNamespaces[ns] = cache.Config{}
+		}
+	}
+
+	mgr, err := controller.NewManager(c.Client, options, c.BMCConnectTimeout, c.PowerCheckInterval, c.InventoryRefreshInterval, c.EnableInventoryCollection, c.MaxConcurrentReconciles)
+	if err != nil {
+		return err
+	}
+
+	return mgr.Start(ctx)
+}

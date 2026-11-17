@@ -1,0 +1,189 @@
+package grpc
+
+import (
+	"testing"
+
+	"github.com/tinkerbell/tinkerbell/pkg/data"
+)
+
+func ptr[T any](v T) *T { return &v }
+
+func TestInBandAttributesFromAgentNil(t *testing.T) {
+	if got := inBandAttributesFromAgent(nil); got != nil {
+		t.Errorf("inBandAttributesFromAgent(nil) = %+v, want nil", got)
+	}
+}
+
+func TestInBandAttributesFromAgent(t *testing.T) {
+	attrs := &data.AgentAttributes{
+		CPU: &data.CPU{
+			TotalCores:   ptr(uint32(8)),
+			TotalThreads: ptr(uint32(16)),
+			Processors: []*data.Processor{
+				{ID: ptr(uint32(2)), Vendor: ptr("GenuineIntel"), Model: ptr("i7"), Cores: ptr(uint32(8)), Threads: ptr(uint32(16)), Capabilities: []string{"fpu", "vme"}},
+			},
+		},
+		Memory: &data.Memory{
+			TotalBytes:  ptr(int64(8_000_000_000)),
+			UsableBytes: ptr(int64(7_500_000_000)),
+		},
+		BlockDevices: []*data.Block{
+			{
+				Name: ptr("nvme0n1"), Vendor: ptr("Samsung"), SerialNumber: ptr("S1"), Path: ptr("pci-0000:17:00.0-nvme-1"),
+				SizeBytes: ptr(int64(20_000_000_000)), PhysicalBlockSizeBytes: ptr(int64(512)),
+			},
+		},
+		NetworkInterfaces: []*data.Network{
+			{
+				Name: ptr("eno1"), Mac: ptr("aa:bb:cc:dd:ee:ff"), SpeedMbps: ptr(uint32(1000)), EnabledCapabilities: []string{"tso"},
+				LLDPNeighbors: []*data.LLDPNeighbor{
+					{
+						ChassisID: ptr("aa:bb:cc:00:11:22"), SystemName: ptr("switch01"),
+						PortID: ptr("Gi1/0/1"), PortDescription: ptr("uplink"),
+					},
+					nil,
+					{ChassisID: ptr("aa:bb:cc:00:11:33"), SystemName: ptr("vswitch01"), PortID: ptr("vnet0")},
+				},
+			},
+		},
+		PCIDevices: []*data.PCI{
+			{Vendor: ptr("Intel"), Product: ptr("Ethernet Controller"), Class: ptr("0200"), Driver: ptr("ixgbe")},
+		},
+		GPUDevices: []*data.GPU{
+			{Vendor: ptr("NVIDIA"), Product: ptr("A100"), Class: ptr("0300"), Driver: ptr("nvidia")},
+		},
+		Chassis:   &data.Chassis{Vendor: ptr("Dell"), Serial: ptr("CH1")},
+		BIOS:      &data.BIOS{Vendor: ptr("Dell Inc."), Version: ptr("2.10.2"), ReleaseDate: ptr("01/01/2024")},
+		Baseboard: &data.Baseboard{Vendor: ptr("Dell"), Product: ptr("0ABC123"), Version: ptr("A01"), SerialNumber: ptr("BB1")},
+		Product:   &data.Product{Name: ptr("PowerEdge R750"), Vendor: ptr("Dell Inc."), SerialNumber: ptr("SN1")},
+	}
+
+	got := inBandAttributesFromAgent(attrs)
+	if got == nil {
+		t.Fatal("inBandAttributesFromAgent() = nil, want populated")
+	}
+
+	if got.CPU == nil || got.CPU.TotalCores != 8 || got.CPU.TotalThreads != 16 {
+		t.Errorf("CPU = %+v, want TotalCores=8 TotalThreads=16", got.CPU)
+	}
+	if len(got.CPU.Sockets) != 1 || got.CPU.Sockets[0].Model != "i7" || len(got.CPU.Sockets[0].Capabilities) != 2 || got.CPU.Sockets[0].Slot != "2" {
+		t.Errorf("CPU.Sockets = %+v, want one entry with Model=i7, Slot=2, and 2 capabilities", got.CPU.Sockets)
+	}
+	if got.Memory == nil || got.Memory.TotalBytes != 8_000_000_000 || got.Memory.UsableBytes != 7_500_000_000 {
+		t.Errorf("Memory = %+v, want TotalBytes=8000000000 UsableBytes=7500000000", got.Memory)
+	}
+
+	if len(got.BlockDevices) != 1 || got.BlockDevices[0].Name != "nvme0n1" || got.BlockDevices[0].SerialNumber != "S1" || got.BlockDevices[0].Path != "pci-0000:17:00.0-nvme-1" {
+		t.Errorf("BlockDevices = %+v, want one entry with Name=nvme0n1 SerialNumber=S1 Path=pci-0000:17:00.0-nvme-1", got.BlockDevices)
+	}
+	if got.BlockDevices[0].SizeBytes != 20_000_000_000 || got.BlockDevices[0].PhysicalBlockSizeBytes != 512 {
+		t.Errorf("BlockDevices[0] = %+v, want SizeBytes=20000000000 PhysicalBlockSizeBytes=512", got.BlockDevices[0])
+	}
+
+	if len(got.NetworkInterfaces) != 1 {
+		t.Fatalf("NetworkInterfaces = %+v, want one entry", got.NetworkInterfaces)
+	}
+	nic := got.NetworkInterfaces[0]
+	if nic.Name != "eno1" || len(nic.Ports) != 1 {
+		t.Fatalf("NetworkInterfaces[0] = %+v, want Name=eno1 with one synthesized port", nic)
+	}
+	if nic.Ports[0].MAC != "aa:bb:cc:dd:ee:ff" || nic.Ports[0].SpeedMbps != 1000 {
+		t.Errorf("NetworkInterfaces[0].Ports[0] = %+v, want MAC=aa:bb:cc:dd:ee:ff SpeedMbps=1000", nic.Ports[0])
+	}
+	if len(nic.Ports[0].EnabledCapabilities) != 1 || nic.Ports[0].EnabledCapabilities[0] != "tso" {
+		t.Errorf("NetworkInterfaces[0].Ports[0].EnabledCapabilities = %v, want [tso]", nic.Ports[0].EnabledCapabilities)
+	}
+	neighbors := nic.Ports[0].LLDPNeighbors
+	if len(neighbors) != 2 {
+		t.Fatalf("NetworkInterfaces[0].Ports[0].LLDPNeighbors = %+v, want two entries (nil entry skipped)", neighbors)
+	}
+	neighbor := neighbors[0]
+	if neighbor.ChassisID != "aa:bb:cc:00:11:22" || neighbor.SystemName != "switch01" || neighbor.PortID != "Gi1/0/1" || neighbor.PortDescription != "uplink" {
+		t.Errorf("LLDPNeighbors[0] = %+v, want ChassisID=aa:bb:cc:00:11:22 SystemName=switch01 PortID=Gi1/0/1 PortDescription=uplink", neighbor)
+	}
+	if neighbors[1].ChassisID != "aa:bb:cc:00:11:33" || neighbors[1].SystemName != "vswitch01" || neighbors[1].PortID != "vnet0" {
+		t.Errorf("LLDPNeighbors[1] = %+v, want ChassisID=aa:bb:cc:00:11:33 SystemName=vswitch01 PortID=vnet0", neighbors[1])
+	}
+
+	if len(got.PCIDevices) != 1 || got.PCIDevices[0].Model != "Ethernet Controller" {
+		t.Errorf("PCIDevices = %+v, want one entry with Model=Ethernet Controller (mapped from PCI.Product)", got.PCIDevices)
+	}
+	if len(got.GPUDevices) != 1 || got.GPUDevices[0].Model != "A100" {
+		t.Errorf("GPUDevices = %+v, want one entry with Model=A100 (mapped from GPU.Product)", got.GPUDevices)
+	}
+
+	if got.Chassis == nil || got.Chassis.Vendor != "Dell" || got.Chassis.SerialNumber != "CH1" {
+		t.Errorf("Chassis = %+v, want Vendor=Dell SerialNumber=CH1", got.Chassis)
+	}
+	if got.BIOS == nil || got.BIOS.FirmwareVersion != "2.10.2" || got.BIOS.ReleaseDate != "01/01/2024" {
+		t.Errorf("BIOS = %+v, want FirmwareVersion=2.10.2 ReleaseDate=01/01/2024 (mapped from BIOS.Version)", got.BIOS)
+	}
+	if got.Baseboard == nil || got.Baseboard.Model != "0ABC123" || got.Baseboard.FirmwareVersion != "A01" {
+		t.Errorf("Baseboard = %+v, want Model=0ABC123 FirmwareVersion=A01 (mapped from Baseboard.Product/Version)", got.Baseboard)
+	}
+	if got.Product == nil || got.Product.Name != "PowerEdge R750" || got.Product.SerialNumber != "SN1" {
+		t.Errorf("Product = %+v, want Name=PowerEdge R750 SerialNumber=SN1", got.Product)
+	}
+
+	// CollectionMethod and LastUpdated aren't Agent-collected fields; the caller
+	// (updateHardwareWithAttributes) sets them, not this mapping function.
+	if got.CollectionMethod != "" {
+		t.Errorf("CollectionMethod = %q, want empty (set by the caller)", got.CollectionMethod)
+	}
+	if got.LastUpdated != nil {
+		t.Errorf("LastUpdated = %v, want nil (set by the caller)", got.LastUpdated)
+	}
+}
+
+func TestInBandAttributesFromAgentEmpty(t *testing.T) {
+	// An AgentAttributes with no sub-structs set at all must not panic.
+	got := inBandAttributesFromAgent(&data.AgentAttributes{})
+	if got == nil {
+		t.Fatal("inBandAttributesFromAgent() = nil, want populated")
+	}
+	if got.CPU != nil || got.Chassis != nil || got.BIOS != nil || got.Baseboard != nil || got.Product != nil {
+		t.Errorf("got = %+v, want all optional subtrees nil", got)
+	}
+}
+
+// parseSpeedMbps moved to tink/agent/internal/attribute (PR #913); the Agent
+// now reports SpeedMbps as a number, so this package no longer parses speed
+// strings. See attribute_test.go there for its tests.
+
+func TestInBandAttributesFromAgentDropsEmptyPorts(t *testing.T) {
+	// The mapper emits one port per interface verbatim; the caller's PruneEmpty
+	// then drops structurally-empty ports. A name-only interface and one with an
+	// empty MAC collapse to len(Ports)==0 (which the UI treats as "name-only"),
+	// while a reported null "00:00:..." MAC is non-empty and kept verbatim.
+	attrs := &data.AgentAttributes{
+		NetworkInterfaces: []*data.Network{
+			{Name: ptr("enp1s0"), Mac: ptr("52:54:00:41:05:c6")},
+			{Name: ptr("ip6tnl0"), Mac: ptr("")},
+			{Name: ptr("tunl0"), Mac: ptr("00:00:00:00")},
+			{Name: ptr("lo")},
+		},
+	}
+
+	got := inBandAttributesFromAgent(attrs)
+	got.PruneEmpty()
+
+	if len(got.NetworkInterfaces) != 4 {
+		t.Fatalf("NetworkInterfaces = %+v, want 4", got.NetworkInterfaces)
+	}
+	for _, nic := range got.NetworkInterfaces {
+		switch nic.Name {
+		case "enp1s0":
+			if len(nic.Ports) != 1 || nic.Ports[0].MAC != "52:54:00:41:05:c6" {
+				t.Errorf("enp1s0 Ports = %+v, want one port with the real MAC", nic.Ports)
+			}
+		case "tunl0":
+			if len(nic.Ports) != 1 || nic.Ports[0].MAC != "00:00:00:00" {
+				t.Errorf("tunl0 Ports = %+v, want the null MAC preserved", nic.Ports)
+			}
+		case "ip6tnl0", "lo":
+			if len(nic.Ports) != 0 {
+				t.Errorf("%s Ports = %+v, want no ports", nic.Name, nic.Ports)
+			}
+		}
+	}
+}

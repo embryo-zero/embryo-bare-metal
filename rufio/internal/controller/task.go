@@ -1,0 +1,438 @@
+/*
+Copyright 2022 Tinkerbell.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	bmclib "github.com/bmc-toolbox/bmclib/v2"
+	bmclibbmc "github.com/bmc-toolbox/bmclib/v2/bmc"
+	"github.com/go-logr/logr"
+	"github.com/tinkerbell/tinkerbell/api/v1alpha1/bmc"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+)
+
+const (
+	powerActionRequeueAfter = 3 * time.Second
+	// taskTimeout bounds how long a started Task may keep being requeued (status checks, transient
+	// BMC connection errors) before it is failed.
+	taskTimeout = 10 * time.Minute
+)
+
+// TaskReconciler reconciles a Task object.
+type TaskReconciler struct {
+	client           client.Client
+	bmcClientFactory ClientFunc
+}
+
+// NewTaskReconciler returns a new TaskReconciler.
+func NewTaskReconciler(c client.Client, bmcClientFactory ClientFunc) *TaskReconciler {
+	return &TaskReconciler{
+		client:           c,
+		bmcClientFactory: bmcClientFactory,
+	}
+}
+
+//+kubebuilder:rbac:groups=bmc.tinkerbell.org,resources=tasks,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=bmc.tinkerbell.org,resources=tasks/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=bmc.tinkerbell.org,resources=tasks/finalizers,verbs=update
+
+// Reconcile runs a Task.
+// Establishes a connection to the BMC.
+// Runs the specified action in the Task.
+func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := ctrl.LoggerFrom(ctx).WithName("controllers/Task").WithValues("task", req.NamespacedName)
+	logger.Info("Reconciling Task")
+
+	// Fetch the Task object
+	task := &bmc.Task{}
+	if err := r.client.Get(ctx, req.NamespacedName, task); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
+		logger.Error(err, "Failed to get Task")
+		return ctrl.Result{}, err
+	}
+
+	// Deletion is a noop.
+	if !task.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+
+	// Task is Completed or Failed is noop.
+	if task.HasCondition(bmc.TaskFailed, bmc.ConditionTrue) ||
+		task.HasCondition(bmc.TaskCompleted, bmc.ConditionTrue) {
+		return ctrl.Result{}, nil
+	}
+
+	// Create a patch from the initial Task object
+	// Patch is used to update Status after reconciliation
+	taskPatch := client.MergeFrom(task.DeepCopy())
+	logger = logger.WithValues("action", task.Spec.Task, "host", task.Spec.Connection.Host)
+
+	return r.doReconcile(ctx, task, taskPatch, logger)
+}
+
+func (r *TaskReconciler) doReconcile(ctx context.Context, task *bmc.Task, taskPatch client.Patch, logger logr.Logger) (ctrl.Result, error) {
+	var username, password string
+	opts := &BMCOptions{
+		ProviderOptions: task.Spec.Connection.ProviderOptions,
+	}
+	if task.Spec.Connection.ProviderOptions != nil && task.Spec.Connection.ProviderOptions.RPC != nil {
+		opts.ProviderOptions = task.Spec.Connection.ProviderOptions
+		if task.Spec.Connection.ProviderOptions.RPC.HMAC != nil && len(task.Spec.Connection.ProviderOptions.RPC.HMAC.Secrets) > 0 {
+			se, err := retrieveHMACSecrets(ctx, r.client, task.Spec.Connection.ProviderOptions.RPC.HMAC.Secrets, task.Namespace)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("unable to get hmac secrets: %w", err)
+			}
+			opts.rpcSecrets = se
+		}
+	} else {
+		// Fetching username, password from SecretReference in Connection.
+		// Requeue if error fetching secret
+		var err error
+		username, password, err = resolveAuthSecretRef(ctx, r.client, task.Spec.Connection.AuthSecretRef, task.Namespace)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("resolving connection secret for task %s/%s: %w", task.Namespace, task.Name, err)
+		}
+	}
+
+	// A Task that already ran its action must not be failed because a later status check could not
+	// reach the BMC: BMCs are routinely slow or unreachable for a few seconds right after a power
+	// action. Only fail such a Task once it exceeds the task timeout.
+	started := !task.Status.StartTime.IsZero()
+	if started {
+		jobRunningTime := time.Since(task.Status.StartTime.Time)
+		// TODO(pokearu): add timeout for tasks on API spec
+		if jobRunningTime >= taskTimeout {
+			timeOutErr := fmt.Errorf("bmc task timeout: %s", jobRunningTime)
+			// Set Task Condition Failed True
+			task.SetCondition(bmc.TaskFailed, bmc.ConditionTrue, bmc.WithTaskConditionMessage(timeOutErr.Error()))
+			patchErr := r.patchStatus(ctx, task, taskPatch)
+			if patchErr != nil {
+				return ctrl.Result{}, utilerrors.NewAggregate([]error{patchErr, timeOutErr})
+			}
+
+			return ctrl.Result{}, timeOutErr
+		}
+	}
+
+	// Resolve what the action needs from the cluster before connecting to the BMC, so a bad
+	// reference is retried instead of failing the Task. Only needed for a new run.
+	var certificatePEM string
+	if ci := certificateImport(task.Spec.Task); ci != nil && !started {
+		var err error
+		certificatePEM, err = resolveCertificatePEM(ctx, r.client, task.Namespace, ci.CertificatePEMConfigMapRef)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("resolving certificatePEMConfigMapRef for task %s/%s: %w", task.Namespace, task.Name, err)
+		}
+	}
+
+	// Initializing BMC Client
+	bmcClient, err := r.bmcClientFactory(ctx, logger, task.Spec.Connection.Host, username, password, opts)
+	if err != nil {
+		if started {
+			logger.V(1).Info("BMC connection failed while checking the status of a started task, will retry", "error", err.Error(), "requeueAfter", powerActionRequeueAfter)
+			return ctrl.Result{RequeueAfter: powerActionRequeueAfter}, nil
+		}
+		logger.Error(err, "BMC connection failed", "host", task.Spec.Connection.Host)
+		task.SetCondition(bmc.TaskFailed, bmc.ConditionTrue, bmc.WithTaskConditionMessage(fmt.Sprintf("Failed to connect to BMC: %v", err)))
+		patchErr := r.patchStatus(ctx, task, taskPatch)
+		if patchErr != nil {
+			return ctrl.Result{}, utilerrors.NewAggregate([]error{patchErr, err})
+		}
+
+		return ctrl.Result{}, err
+	}
+	defer func() {
+		// Close BMC connection after reconciliation
+		if err := bmcClient.Close(ctx); err != nil {
+			md := bmcClient.GetMetadata()
+			logger.Error(err, "BMC close connection failed", "providersAttempted", md.ProvidersAttempted)
+
+			return
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("BMC connection closed", "successfulCloseConns", md.SuccessfulCloseConns, "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider)
+	}()
+
+	// Task has StartTime, we check the status.
+	// Requeue if actions did not complete.
+	if started {
+		result, err := r.checkTaskStatus(ctx, logger, task.Spec.Task, bmcClient)
+		if err != nil {
+			return result, fmt.Errorf("bmc task status check: %w", err)
+		}
+
+		if !result.IsZero() {
+			return result, nil
+		}
+
+		// Set the Task CompletionTime
+		now := metav1.Now()
+		task.Status.CompletionTime = &now
+		// Set Task Condition Completed True
+		task.SetCondition(bmc.TaskCompleted, bmc.ConditionTrue)
+		if err := r.patchStatus(ctx, task, taskPatch); err != nil {
+			return result, err
+		}
+
+		return result, nil
+	}
+
+	logger.Info("new task run")
+
+	// Set the Task StartTime
+	now := metav1.Now()
+	task.Status.StartTime = &now
+	// run the specified Task in Task
+	if err := r.runTask(ctx, logger, task.Spec.Task, bmcClient, certificatePEM); err != nil {
+		md := bmcClient.GetMetadata()
+		logger.Info("failed to perform action", "providersAttempted", md.ProvidersAttempted, "action", task.Spec.Task)
+		// Set Task Condition Failed True
+		task.SetCondition(bmc.TaskFailed, bmc.ConditionTrue, bmc.WithTaskConditionMessage(err.Error()))
+		patchErr := r.patchStatus(ctx, task, taskPatch)
+		if patchErr != nil {
+			return ctrl.Result{}, utilerrors.NewAggregate([]error{patchErr, err})
+		}
+
+		return ctrl.Result{}, err
+	}
+
+	if err := r.patchStatus(ctx, task, taskPatch); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// certificateImport returns the Secure Boot certificate import in action, or nil if it has none.
+func certificateImport(action bmc.Action) *bmc.SecureBootCertificateImportAction {
+	if action.SecureBoot == nil {
+		return nil
+	}
+
+	return action.SecureBoot.CertificateImport
+}
+
+// runTask executes the defined Task in a Task. certificatePEM is the certificate a Secure Boot
+// certificateImport action imports, already resolved by the caller.
+func (r *TaskReconciler) runTask(ctx context.Context, logger logr.Logger, task bmc.Action, bmcClient *bmclib.Client, certificatePEM string) error {
+	if task.PowerAction != nil {
+		ok, err := bmcClient.SetPowerState(ctx, string(*task.PowerAction))
+		if err != nil {
+			return fmt.Errorf("failed to perform PowerAction: %w", err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("power state set successfully", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "ok", ok)
+
+		return nil
+	}
+
+	if task.OneTimeBootDeviceAction != nil { //nolint:staticcheck // oneTimeBootDeviceAction is deprecated but still supported for backward compatibility. We will remove in a future release.
+		// OneTimeBootDeviceAction currently sets the first boot device from Devices.
+		// setPersistent is false.
+		if len(task.OneTimeBootDeviceAction.Devices) == 0 { //nolint:staticcheck // oneTimeBootDeviceAction is deprecated but still supported for backward compatibility. We will remove in a future release.
+			return errors.New("failed to perform OneTimeBootDeviceAction: no boot device specified")
+		}
+		ok, err := bmcClient.SetBootDevice(ctx, string(task.OneTimeBootDeviceAction.Devices[0]), false, task.OneTimeBootDeviceAction.EFIBoot) //nolint:staticcheck // oneTimeBootDeviceAction is deprecated but still supported for backward compatibility. We will remove in a future release.
+		if err != nil {
+			return fmt.Errorf("failed to perform OneTimeBootDeviceAction: %w", err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("one time boot device set successfully", "notice", "oneTimeBootDeviceAction is deprecated and will be remove in a future release. Please use bootDevice instead.", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "ok", ok)
+
+		return nil
+	}
+
+	if task.BootDevice != nil {
+		ok, err := bmcClient.SetBootDevice(ctx, task.BootDevice.Device.String(), task.BootDevice.Persistent, task.BootDevice.EFIBoot)
+		if err != nil || !ok {
+			return fmt.Errorf("failed to set BootDevice, ok: %v, err: %w", ok, err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("boot device set successfully", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "ok", ok)
+
+		return nil
+	}
+
+	if task.VirtualMediaAction != nil {
+		ok, err := bmcClient.SetVirtualMedia(ctx, string(task.VirtualMediaAction.Kind), task.VirtualMediaAction.MediaURL)
+		if err != nil {
+			return fmt.Errorf("failed to perform SetVirtualMedia: %w", err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("virtual media set successfully", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "ok", ok)
+
+		return nil
+	}
+
+	if task.NetworkBootConfig != nil {
+		return r.runNetworkBootConfig(ctx, logger, task.NetworkBootConfig, bmcClient)
+	}
+
+	if task.SecureBoot != nil {
+		return r.runSecureBoot(ctx, logger, task.SecureBoot, bmcClient, certificatePEM)
+	}
+
+	logger.Info("no action specified in Task, nothing to do", "task", task)
+
+	return errors.New("no action specified in Task, nothing to do")
+}
+
+// runNetworkBootConfig applies the independent, individually-optional fields of a
+// NetworkBootConfig action: any combination of HTTPBootEnabled/PXEBootEnabled, HTTPBootURL, and
+// HTTPBootTLSMode may be set at once. HTTPBootTLSMode is applied before HTTPBootURL so that
+// relaxing TLS (e.g. Dell's default "OneWay" mode) takes effect before a plain-HTTP URL is set -
+// setting the URL first would have the BMC reject it under the still-active stricter mode.
+func (r *TaskReconciler) runNetworkBootConfig(ctx context.Context, logger logr.Logger, cfg *bmc.NetworkBootConfig, bmcClient *bmclib.Client) error {
+	if cfg.HTTPBootEnabled != nil || cfg.PXEBootEnabled != nil {
+		ok, err := bmcClient.SetNetworkBootEnabled(ctx, cfg.HTTPBootEnabled, cfg.PXEBootEnabled)
+		if err != nil || !ok {
+			return fmt.Errorf("failed to set network boot enabled state, ok: %v, err: %w", ok, err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("network boot enabled state set successfully",
+			"httpBootEnabled", boolPtrValue(cfg.HTTPBootEnabled),
+			"pxeBootEnabled", boolPtrValue(cfg.PXEBootEnabled),
+			"providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider)
+	}
+
+	if cfg.HTTPBootTLSMode != nil {
+		ok, err := bmcClient.SetHTTPBootTLSMode(ctx, bmclibbmc.HTTPBootTLSMode(*cfg.HTTPBootTLSMode))
+		if err != nil || !ok {
+			return fmt.Errorf("failed to set HTTP boot TLS mode, ok: %v, err: %w", ok, err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("http boot tls mode set successfully", "httpBootTLSMode", *cfg.HTTPBootTLSMode, "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider)
+	}
+
+	if cfg.HTTPBootURL != nil {
+		ok, err := bmcClient.SetHTTPBootURI(ctx, *cfg.HTTPBootURL)
+		if err != nil || !ok {
+			return fmt.Errorf("failed to set HTTP boot URL, ok: %v, err: %w", ok, err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("http boot url set successfully", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "ok", ok)
+	}
+
+	return nil
+}
+
+// runSecureBoot performs the single UEFI Secure Boot operation set in a SecureBootAction.
+func (r *TaskReconciler) runSecureBoot(ctx context.Context, logger logr.Logger, sb *bmc.SecureBootAction, bmcClient *bmclib.Client, certificatePEM string) error {
+	switch {
+	case sb.Enable != nil:
+		if err := bmcClient.SetSecureBoot(ctx, *sb.Enable); err != nil {
+			return fmt.Errorf("failed to perform SetSecureBoot: %w", err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("secure boot state set successfully", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "enable", *sb.Enable)
+	case sb.AllowCustomKeys != nil:
+		rebootRequired, err := bmcClient.AllowCustomSecureBootKeys(ctx, *sb.AllowCustomKeys)
+		if err != nil {
+			return fmt.Errorf("failed to perform AllowCustomSecureBootKeys: %w", err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("custom secure boot keys acceptance set successfully", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "allowCustomKeys", *sb.AllowCustomKeys, "rebootRequired", rebootRequired)
+	case sb.ResetKeys != nil:
+		if err := bmcClient.ResetSecureBootKeys(ctx, bmclibbmc.ResetSecureBootKeysType(sb.ResetKeys.ResetType)); err != nil {
+			return fmt.Errorf("failed to perform ResetSecureBootKeys: %w", err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("secure boot keys reset successfully", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "resetType", sb.ResetKeys.ResetType)
+	case sb.DatabaseResetKeys != nil:
+		if err := bmcClient.ResetSecureBootDatabaseKeys(ctx, bmclibbmc.SecureBootDatabase(sb.DatabaseResetKeys.Database), bmclibbmc.ResetSecureBootDatabaseKeysType(sb.DatabaseResetKeys.ResetType)); err != nil {
+			return fmt.Errorf("failed to perform ResetSecureBootDatabaseKeys: %w", err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("secure boot database keys reset successfully", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "database", sb.DatabaseResetKeys.Database, "resetType", sb.DatabaseResetKeys.ResetType)
+	case sb.CertificateImport != nil:
+		if err := bmcClient.ImportSecureBootCertificate(ctx, bmclibbmc.SecureBootDatabase(sb.CertificateImport.Database), certificatePEM); err != nil {
+			return fmt.Errorf("failed to perform ImportSecureBootCertificate: %w", err)
+		}
+		md := bmcClient.GetMetadata()
+		logger.Info("secure boot certificate imported successfully", "providersAttempted", md.ProvidersAttempted, "successfulProvider", md.SuccessfulProvider, "database", sb.CertificateImport.Database)
+	default:
+		return errors.New("no secure boot operation specified in Task, nothing to do")
+	}
+
+	return nil
+}
+
+// boolPtrValue returns the pointed-to value for logging, or nil if b is nil, so log lines show
+// "true"/"false"/"<nil>" instead of a pointer address.
+func boolPtrValue(b *bool) any {
+	if b == nil {
+		return nil
+	}
+	return *b
+}
+
+// checkTaskStatus checks if Task action completed.
+// This is currently limited only to a few PowerAction types.
+func (r *TaskReconciler) checkTaskStatus(ctx context.Context, log logr.Logger, task bmc.Action, bmcClient *bmclib.Client) (ctrl.Result, error) {
+	// TODO(pokearu): Extend to all actions.
+	if task.PowerAction != nil {
+		rawState, err := bmcClient.GetPowerState(ctx)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to get power state: %w", err)
+		}
+		log = log.WithValues("currentPowerState", rawState)
+		log.Info("power state check")
+
+		state := toPowerState(rawState)
+
+		switch *task.PowerAction { //nolint:exhaustive // we only support a few power actions right now.
+		case bmc.PowerOn:
+			if state != bmc.On {
+				log.Info("requeuing task", "requeueAfter", powerActionRequeueAfter)
+				return ctrl.Result{RequeueAfter: powerActionRequeueAfter}, nil
+			}
+		case bmc.PowerHardOff, bmc.PowerSoftOff:
+			if bmc.Off != state {
+				return ctrl.Result{RequeueAfter: powerActionRequeueAfter}, nil
+			}
+		}
+	}
+
+	// Other Task action types do not support checking status. So noop.
+	return ctrl.Result{}, nil
+}
+
+// patchStatus patches the specified patch on the Task.
+func (r *TaskReconciler) patchStatus(ctx context.Context, task *bmc.Task, patch client.Patch) error {
+	if err := client.IgnoreNotFound(r.client.Status().Patch(ctx, task, patch)); err != nil {
+		return fmt.Errorf("failed to patch Task %s/%s status: %w", task.Namespace, task.Name, err)
+	}
+
+	return nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager, opts ctrlcontroller.Options) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(opts).
+		For(&bmc.Task{}).
+		Complete(r)
+}
